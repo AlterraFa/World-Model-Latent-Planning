@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Experiment folder and model weights
+**/**Experiment**/**
+*.onnx
+*.ckpt
+*.pth
+*.pt
+*.engine
+
+# Image files
+*.jpg
+*.png
+*.jpeg
+*.bmp
