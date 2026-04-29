@@ -1,0 +1,56 @@
+app: latent_dreaming
+
+common: &common_settings
+  patch_size: 16
+  tubelet_size: 2
+  crop_size: 224
+  fpcs: 16
+
+train:
+  <<: *common_settings
+  batch_size: 20
+  num_workers: 4
+  persistent_workers: true
+  pin_mem: true
+  datasets_path: []
+
+model: 
+  timescale: 1.0
+
+  encoder:
+    <<: *common_settings
+    name: vjepa2_1_vit_base_384
+    load_from: facebookresearch/vjepa2
+    source: github
+    use_sdpa: true
+    use_rope: true
+    use_activation_checkpointing: true
+
+  diffuser:
+    target: networks.DiT.dit.STDiT
+    params:
+      max_num_frames: 64
+      diffuse_dim: &diffuse_dim 512
+      depth: 24
+      num_heads: 16
+      mlp_ratio: 4
+      input_size:
+      - ${div:${common.crop_size}, ${common.patch_size}}
+      - ${div:${common.crop_size}, ${common.patch_size}}
+      patch_size: 1
+      dropout: 0.0
+      ctx_noise_aug_ratio: 0.1
+      ctx_noise_aug_prob: 0.5
+      drop_ctx_rate: 0.1
+
+data_aug: {}
+
+loss: {}
+
+optimization: {}
+
+meta: {}
+
+checkpoint: {}
+
+logging: {}

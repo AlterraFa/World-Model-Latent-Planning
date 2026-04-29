@@ -145,7 +145,8 @@ if __name__ == "__main__":
 
     from omegaconf import OmegaConf
     
-    cfg = OmegaConf.load("./cfgs/latent_dreaming/default.yaml")
+    cfg = OmegaConf.load("./cfgs/latent_dreaming/diffusion-wm.yaml")
+    OmegaConf.register_new_resolver("div", lambda x, y: int(x / y))
     model_cfg = cfg['model']
     
     model = DiffusionWM(generator_config = model_cfg['diffuser'], encoder_config = model_cfg['encoder']).to(device)
