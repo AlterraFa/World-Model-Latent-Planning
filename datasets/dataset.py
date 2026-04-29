@@ -1,5 +1,6 @@
 import bisect
 import os, sys
+import pickle
 
 script_dir = os.path.dirname(__file__)
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
@@ -77,12 +78,10 @@ class NuplanDataset(Dataset):
         self,
         database_paths,
         image_root="./",
-        channel="CAM_F0",
         fpcs=16,
         duration_s=10.0,
-        nclips = 1, 
         random_jiggle_part=True,
-        allow_clip_overlap=False,
+        channel="CAM_F0",
         meta_keys=None,
         shared_transform=None,
         individual_transform=None,
@@ -90,15 +89,10 @@ class NuplanDataset(Dataset):
         super().__init__()
         self._db_paths = database_paths
         self.image_root = image_root
-
-        self.channel = channel
         self.fpcs = fpcs
         self.duration_s = duration_s
-        self.nclips = nclips
-
         self.random_jiggle_part = random_jiggle_part
-        self.allow_clip_overlap = allow_clip_overlap
-        
+        self.channel = channel
         self.meta_keys = self._normalize_meta_keys(meta_keys)
         self.individual_transform = individual_transform
         self.shared_transform = shared_transform
@@ -117,20 +111,32 @@ class NuplanDataset(Dataset):
                             self._log_dirs[sub.name] = entry.path
 
         # Build flat index: one entry per log (one sample = one log + random time window).
-        self.samples = []  # [(db_path, log_token_hex), ...]
-        for db_path in tqdm(database_paths, desc="Indexing databases"):
-            con = sqlite3.connect(db_path)
-            con.row_factory = sqlite3.Row
-            rows = con.execute(
-                "SELECT hex(token) FROM log ORDER BY rowid ASC"
-            ).fetchall()
-            for r in rows:
-                log_token_hex = r["hex(token)"]
-                self.samples.append((db_path, log_token_hex))
-                self._log_time_cache[(db_path, log_token_hex)] = self._build_log_time_cache(
-                    con, bytearray.fromhex(log_token_hex)
-                )
-            con.close()
+        _cache_path = ".cache/dataset_cache.pkl"
+        _db_set = set(database_paths)
+        _cached_db_set: set = set()
+        if os.path.exists(_cache_path):
+            with open(_cache_path, "rb") as _f:
+                _cached_db_set, self.samples, self._log_time_cache = pickle.load(_f)
+        if _cached_db_set != _db_set:
+            # New or removed DBs detected — rebuild index from scratch.
+            self.samples = []
+            self._log_time_cache = {}
+            for db_path in tqdm(database_paths, desc="Indexing databases"):
+                con = sqlite3.connect(db_path)
+                con.row_factory = sqlite3.Row
+                rows = con.execute(
+                    "SELECT hex(token) FROM log ORDER BY rowid ASC"
+                ).fetchall()
+                for r in rows:
+                    log_token_hex = r["hex(token)"]
+                    self.samples.append((db_path, log_token_hex))
+                    self._log_time_cache[(db_path, log_token_hex)] = self._build_log_time_cache(
+                        con, bytearray.fromhex(log_token_hex)
+                    )
+                con.close()
+            os.makedirs(os.path.dirname(_cache_path), exist_ok=True)
+            with open(_cache_path, "wb") as _f:
+                pickle.dump((_db_set, self.samples, self._log_time_cache), _f)
 
     # ------------------------------------------------------------------
     # Image path resolution
@@ -245,50 +251,35 @@ class NuplanDataset(Dataset):
             (self.channel, scene_start_ts, scene_end_ts),
         ).fetchall()
 
-    def _sample_clip_start_times(self, cam_timestamps):
-        """Return start timestamps for each clip.
-
-        If ``allow_clip_overlap`` is False, starts are spaced by one full
-        clip duration whenever possible (non-overlap). If True, starts target
-        a small overlap (~10%) between consecutive clips.
-        """
+    def _sample_sequence_indices(self, seq_len):
         nclips = max(1, int(self.nclips))
-        if nclips == 1:
-            if not cam_timestamps:
-                return []
-            duration_us = int(self.duration_s * 1_000_000)
-            t_first = cam_timestamps[0]
-            t_last = cam_timestamps[-1]
-            max_start = t_last - duration_us
-            if max_start <= t_first:
-                return [int(t_first)]
-            start_ts = random.randint(t_first, max_start) if self.random_jiggle_part else t_first
-            return [int(start_ts)]
+        frame_step = max(1, int(self.frame_step))
+        fpcs = max(1, int(self.fpcs)) if self.fpcs is not None else seq_len
+        target_span = max(1, fpcs * frame_step)
 
-        if not cam_timestamps:
-            return []
+        sampled_indices = []
+        for clip_idx in range(nclips):
+            if seq_len <= target_span:
+                start_idx = 0
+                end_idx = seq_len
+            else:
+                max_start = seq_len - target_span
+                if self.random_jiggle_part:
+                    start_idx = np.random.randint(0, max_start + 1)
+                elif nclips > 1:
+                    start_idx = int(round((clip_idx / (nclips - 1)) * max_start))
+                else:
+                    start_idx = 0
+                end_idx = start_idx + target_span
 
-        duration_us = int(self.duration_s * 1_000_000)
-        t_first = cam_timestamps[0]
-        t_last = cam_timestamps[-1]
-        max_start = t_last - duration_us
+            clip_indices = list(range(start_idx, end_idx, frame_step))
+            if len(clip_indices) >= fpcs:
+                clip_indices = clip_indices[:fpcs]
+            elif len(clip_indices) > 0:
+                clip_indices = clip_indices + [clip_indices[-1]] * (fpcs - len(clip_indices))
+            sampled_indices.extend(clip_indices)
 
-        if max_start <= t_first:
-            return [int(t_first)] * nclips
-
-        # Allow a tiny overlap when requested (~10%).
-        desired_stride = duration_us if not self.allow_clip_overlap else max(1, int(duration_us * 0.9))
-        available_span = max_start - t_first
-        required_span = (nclips - 1) * desired_stride
-
-        if required_span <= available_span:
-            max_base_start = max_start - required_span
-            base_start = random.randint(t_first, max_base_start) if self.random_jiggle_part else t_first
-            return [int(base_start + i * desired_stride) for i in range(nclips)]
-
-        # Not enough time span for desired spacing: distribute starts evenly.
-        starts = np.linspace(t_first, max_start, num=nclips, dtype=np.int64)
-        return [int(s) for s in starts]
+        return sampled_indices
 
     # ------------------------------------------------------------------
     # Log-scoped helpers
@@ -534,7 +525,7 @@ class NuplanDataset(Dataset):
         # ── 2. Get all camera frames for the log ───────────────────────
         all_cam_rows = cache["cam_rows"]
         if not all_cam_rows:
-            empty_clip = {
+            return {
                 "images": None,
                 "ego_pose": np.zeros((0, 7), dtype=np.float32),
                 "agents": [],
@@ -552,185 +543,315 @@ class NuplanDataset(Dataset):
                     "roadblock_ids": [],
                 },
             }
-            return {"clips": [empty_clip for _ in range(max(1, int(self.nclips)))]}
 
-        # ── 3. Pick nclips time windows and sample fpcs frames per clip ─
+        # ── 3. Pick a time window of duration_s, then sample fpcs frames ─
         cam_timestamps = cache["cam_timestamps"]
         duration_us = int(self.duration_s * 1_000_000)
-        clip_starts = self._sample_clip_start_times(cam_timestamps)
+        t_first = cam_timestamps[0]
+        t_last = cam_timestamps[-1]
+        max_start = t_last - duration_us
 
-        # Log-level metadata (shared across all clips from this log).
-        map_version, vehicle_name = "", ""
-        scene_name, roadblock_ids = "", []
-        if "log_meta" in self.meta_keys:
-            map_version, vehicle_name = self._query_log_meta_by_log_token(con, log_token_bytes)
-
-        fpcs = max(1, self.fpcs)
-        clips = []
-        for start_ts in clip_starts:
+        if max_start <= t_first:
+            window_rows = all_cam_rows
+        else:
+            start_ts = random.randint(t_first, max_start) if self.random_jiggle_part else t_first
             end_ts = start_ts + duration_us
             i_start = bisect.bisect_left(cam_timestamps, start_ts)
             i_end = bisect.bisect_right(cam_timestamps, end_ts)
             window_rows = all_cam_rows[i_start:i_end]
 
-            # Ensure every clip has at least one frame if the log has images.
-            if not window_rows:
-                nearest_idx = max(0, min(len(all_cam_rows) - 1, bisect.bisect_left(cam_timestamps, start_ts)))
-                window_rows = [all_cam_rows[nearest_idx]]
+        fpcs = max(1, self.fpcs)
+        if len(window_rows) <= fpcs:
+            sampled_cam_rows = window_rows
+        else:
+            indices = np.linspace(0, len(window_rows) - 1, fpcs, dtype=int)
+            sampled_cam_rows = [window_rows[i] for i in indices]
 
-            if len(window_rows) <= fpcs:
-                sampled_cam_rows = window_rows
-            else:
-                indices = np.linspace(0, len(window_rows) - 1, fpcs, dtype=int)
-                sampled_cam_rows = [window_rows[i] for i in indices]
+        # ── 4. Bisect-lookup nearest lidar_pc for each sampled frame ───
+        image_paths = []
+        frame_tokens_hex = []
+        frame_timestamps = []
+        lp_token_bytes_per_frame = []
 
-            # Bisect-lookup nearest lidar_pc for each sampled frame.
-            image_paths = []
-            frame_tokens_hex = []
-            frame_timestamps = []
-            lp_token_bytes_per_frame = []
+        for cam_row in sampled_cam_rows:
+            filename_jpg, img_ts = cam_row
+            image_paths.append(self._resolve_image_path(filename_jpg))
+            lp_tok, lp_ts = self._bisect_nearest_lidar(lp_timestamps, lp_tokens_raw, img_ts)
+            frame_tokens_hex.append(lp_tok.hex() if lp_tok is not None else "")
+            frame_timestamps.append(lp_ts if lp_ts is not None else img_ts)
+            lp_token_bytes_per_frame.append(lp_tok)
 
-            for cam_row in sampled_cam_rows:
-                filename_jpg, img_ts = cam_row
-                image_paths.append(self._resolve_image_path(filename_jpg))
-                lp_tok, lp_ts = self._bisect_nearest_lidar(lp_timestamps, lp_tokens_raw, img_ts)
-                frame_tokens_hex.append(lp_tok.hex() if lp_tok is not None else "")
-                frame_timestamps.append(lp_ts if lp_ts is not None else img_ts)
-                lp_token_bytes_per_frame.append(lp_tok)
+        # ── 5. Batch metadata queries (one SQL call per enabled key) ───
+        valid_lp_tokens = [t for t in lp_token_bytes_per_frame if t is not None]
 
-            # Batch metadata queries (one SQL call per enabled key).
-            valid_lp_tokens = [t for t in lp_token_bytes_per_frame if t is not None]
+        ego_pose_map: dict = {}
+        agents_map: dict = {}
+        tl_map: dict = {}
+        tags_map: dict = {}
 
-            ego_pose_map: dict = {}
-            agents_map: dict = {}
-            tl_map: dict = {}
-            tags_map: dict = {}
+        if valid_lp_tokens:
+            if "ego_pose" in self.meta_keys:
+                ego_pose_map = self._batch_query_ego_pose(con, valid_lp_tokens)
+            if "agents" in self.meta_keys:
+                agents_map = self._batch_query_agents(con, valid_lp_tokens)
+            if "traffic_lights" in self.meta_keys:
+                tl_map = self._batch_query_traffic_lights(con, valid_lp_tokens)
+            if "scenario_tags" in self.meta_keys:
+                tags_map = self._batch_query_scenario_tags(con, valid_lp_tokens)
 
-            if valid_lp_tokens:
-                if "ego_pose" in self.meta_keys:
-                    ego_pose_map = self._batch_query_ego_pose(con, valid_lp_tokens)
-                if "agents" in self.meta_keys:
-                    agents_map = self._batch_query_agents(con, valid_lp_tokens)
-                if "traffic_lights" in self.meta_keys:
-                    tl_map = self._batch_query_traffic_lights(con, valid_lp_tokens)
-                if "scenario_tags" in self.meta_keys:
-                    tags_map = self._batch_query_scenario_tags(con, valid_lp_tokens)
+        # ── 6. Assemble per-frame lists from batch results ─────────────
+        ego_pose = []
+        agents = []
+        traffic_lights = []
+        scenario_tags = []
 
-            ego_pose = []
-            agents = []
-            traffic_lights = []
-            scenario_tags = []
+        for lp_tok in lp_token_bytes_per_frame:
+            key = bytes(lp_tok) if lp_tok is not None else None
+            if "ego_pose" in self.meta_keys:
+                ego_pose.append(ego_pose_map.get(key))
+            if "agents" in self.meta_keys:
+                agents.append(agents_map.get(key, []))
+            if "traffic_lights" in self.meta_keys:
+                traffic_lights.append(tl_map.get(key, []))
+            if "scenario_tags" in self.meta_keys:
+                scenario_tags.append(tags_map.get(key, []))
 
-            for lp_tok in lp_token_bytes_per_frame:
-                key = bytes(lp_tok) if lp_tok is not None else None
-                if "ego_pose" in self.meta_keys:
-                    ego_pose.append(ego_pose_map.get(key))
-                if "agents" in self.meta_keys:
-                    agents.append(agents_map.get(key, []))
-                if "traffic_lights" in self.meta_keys:
-                    traffic_lights.append(tl_map.get(key, []))
-                if "scenario_tags" in self.meta_keys:
-                    scenario_tags.append(tags_map.get(key, []))
+        # ── 7. Log-level metadata (single query) ───────────────────────
+        map_version, vehicle_name = "", ""
+        scene_name, roadblock_ids = "", []
+        if "log_meta" in self.meta_keys:
+            map_version, vehicle_name = self._query_log_meta_by_log_token(con, log_token_bytes)
 
-            ego_pose_np = np.array(
-                [
-                    [p.x, p.y, p.z, p.qw, p.qx, p.qy, p.qz] if p is not None else [np.nan] * 7
-                    for p in ego_pose
-                ],
-                dtype=np.float32,
-            ) if ego_pose else np.zeros((0, 7), dtype=np.float32)
+        # ── 8. Build decomposed dictionary payload ─────────────────────
+        ego_pose_np = np.array(
+            [
+                [p.x, p.y, p.z, p.qw, p.qx, p.qy, p.qz] if p is not None else [np.nan] * 7
+                for p in ego_pose
+            ],
+            dtype=np.float32,
+        ) if ego_pose else np.zeros((0, 7), dtype=np.float32)
 
-            if not image_paths:
-                images = None
-            else:
-                images = decode_batch(image_paths)
-                if self.individual_transform is not None:
-                    images = np.array([self.individual_transform(img) for img in images])
-                if self.shared_transform is not None:
-                    images = self.shared_transform(images)
+        # ── 9. Decode and transform images ─────────────────────────────
+        if not image_paths:
+            return {
+                "images": None,
+                "ego_pose": ego_pose_np,
+                "agents": agents,
+                "traffic_lights": traffic_lights,
+                "scenario_tags": scenario_tags,
+                "meta": {
+                    "token": anchor_token,
+                    "timestamp": anchor_ts,
+                    "image_paths": image_paths,
+                    "frame_tokens": frame_tokens_hex,
+                    "frame_timestamps": frame_timestamps,
+                    "map_version": map_version,
+                    "vehicle_name": vehicle_name,
+                    "scene_name": scene_name,
+                    "roadblock_ids": roadblock_ids,
+                },
+            }
 
-            clips.append(
-                {
-                    "images": images,
-                    "ego_pose": ego_pose_np,
-                    "agents": agents,
-                    "traffic_lights": traffic_lights,
-                    "scenario_tags": scenario_tags,
-                    "meta": {
-                        "token": anchor_token,
-                        "timestamp": anchor_ts,
-                        "image_paths": image_paths,
-                        "frame_tokens": frame_tokens_hex,
-                        "frame_timestamps": frame_timestamps,
-                        "map_version": map_version,
-                        "vehicle_name": vehicle_name,
-                        "scene_name": scene_name,
-                        "roadblock_ids": roadblock_ids,
-                        "clip_index": len(clips),
-                        "num_clips": len(clip_starts),
-                    },
-                }
-            )
+        images = decode_batch(image_paths)
 
-        return {"clips": clips}
+        if self.individual_transform is not None:
+            images = np.array([self.individual_transform(img) for img in images])
+        if self.shared_transform is not None:
+            images = self.shared_transform(images)
+
+        return {
+            "images": images,
+            "ego_pose": ego_pose_np,
+            "agents": agents,
+            "traffic_lights": traffic_lights,
+            "scenario_tags": scenario_tags,
+            "meta": {
+                "token": anchor_token,
+                "timestamp": anchor_ts,
+                "image_paths": image_paths,
+                "frame_tokens": frame_tokens_hex,
+                "frame_timestamps": frame_timestamps,
+                "map_version": map_version,
+                "vehicle_name": vehicle_name,
+                "scene_name": scene_name,
+                "roadblock_ids": roadblock_ids,
+            },
+        }
+
+def collate_nuplan(batch):
+    # Filter out failed samples
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None, None
+
+    # Support dict-based samples from load_sequences.
+    if isinstance(batch[0], dict):
+        images_list = [item.get("images") for item in batch]
+        frames = []
+        for item in batch:
+            if "frame" in item and item["frame"] is not None:
+                frames.append(item["frame"])
+                continue
+            frames.append(sample_dict_to_nuplan_frame(item))
+    else:
+        # Backward compatibility for tuple/list sample format.
+        frames, images_list = zip(*batch)
+
+    valid_pairs = [(f, i) for f, i in zip(frames, images_list) if f is not None]
+    if not valid_pairs:
+        return None, None
+    frames, images_list = zip(*valid_pairs)
+
+    # Stack images → (B, N, H, W, C) tensor; pad missing with zeros
+    stacked_images = None
+    valid_images = [img for img in images_list if img is not None]
+    if valid_images:
+        ref_shape = valid_images[0].shape  # (N, H, W, C)
+        arrays = [
+            img if img is not None else np.zeros(ref_shape, dtype=np.uint8)
+            for img in images_list
+        ]
+        stacked_images = torch.from_numpy(np.stack(arrays, axis=0))
+
+    batched_frame = NuplanFrame(
+        token=[f.token for f in frames],
+        timestamp=[f.timestamp for f in frames],
+        image_paths=[f.image_paths for f in frames],
+        frame_tokens=[f.frame_tokens for f in frames],
+        frame_timestamps=[f.frame_timestamps for f in frames],
+        ego_pose=[f.ego_pose for f in frames],
+        agents=[f.agents for f in frames],
+        traffic_lights=[f.traffic_lights for f in frames],
+        scenario_tags=[f.scenario_tags for f in frames],
+        map_version=[f.map_version for f in frames],
+        vehicle_name=[f.vehicle_name for f in frames],
+        scene_name=[f.scene_name for f in frames],
+        roadblock_ids=[f.roadblock_ids for f in frames],
+    )
+
+    return batched_frame, stacked_images
+
+
+def ego_pose_array_to_list(ego_pose_arr, frame_ts):
+    if ego_pose_arr is None:
+        return []
+    ego_pose_arr = np.asarray(ego_pose_arr)
+    if ego_pose_arr.size == 0:
+        return []
+
+    ts_list = list(frame_ts) if frame_ts is not None else []
+    poses = []
+    for idx, row in enumerate(ego_pose_arr):
+        if np.isnan(row).all():
+            poses.append(None)
+            continue
+        ts = ts_list[idx] if idx < len(ts_list) else 0
+        poses.append(EgoPose(
+            timestamp=int(ts),
+            x=float(row[0]), y=float(row[1]), z=float(row[2]),
+            qw=float(row[3]), qx=float(row[4]), qy=float(row[5]), qz=float(row[6]),
+            vx=0.0, vy=0.0, vz=0.0,
+            acceleration_x=0.0, acceleration_y=0.0, acceleration_z=0.0,
+            angular_rate_x=0.0, angular_rate_y=0.0, angular_rate_z=0.0,
+        ))
+    return poses
+
+
+def sample_dict_to_nuplan_frame(sample):
+    meta = sample.get("meta") or {}
+    frame_ts = meta.get("frame_timestamps", [])
+    return NuplanFrame(
+        token=meta.get("token", ""),
+        timestamp=meta.get("timestamp", 0),
+        image_paths=meta.get("image_paths", []),
+        frame_tokens=meta.get("frame_tokens", []),
+        frame_timestamps=frame_ts,
+        ego_pose=ego_pose_array_to_list(sample.get("ego_pose"), frame_ts),
+        agents=sample.get("agents", []),
+        traffic_lights=sample.get("traffic_lights", []),
+        scenario_tags=sample.get("scenario_tags", []),
+        map_version=meta.get("map_version", ""),
+        vehicle_name=meta.get("vehicle_name", ""),
+        scene_name=meta.get("scene_name", ""),
+        roadblock_ids=meta.get("roadblock_ids", []),
+    )
+
+
+def quaternion_yaw(qw, qx, qy, qz):
+    """Compute yaw (heading) from quaternion components."""
+    return np.arctan2(
+        2.0 * (qw * qz + qx * qy),
+        1.0 - 2.0 * (qy ** 2 + qz ** 2),
+    )
+
+
+def transform_ego_trajectory_local(ego_pose_seq):
+    """Project global ego poses into a local frame.
+
+    Local frame convention:
+      - origin at first valid pose
+      - +y aligned with first valid pose heading
+
+    Returns a list with the same length as ego_pose_seq where missing poses
+    are kept as None and valid poses are (x_local, y_local) tuples.
+    """
+    if not ego_pose_seq:
+        return []
+
+    transformed = [None] * len(ego_pose_seq)
+    first_idx = next((i for i, ep in enumerate(ego_pose_seq) if ep is not None), None)
+    if first_idx is None:
+        return transformed
+
+    ep0 = ego_pose_seq[first_idx]
+    ref_x, ref_y = ep0.x, ep0.y
+    yaw0 = quaternion_yaw(ep0.qw, ep0.qx, ep0.qy, ep0.qz)
+    cos_a, sin_a = np.cos(-yaw0 + np.pi / 2), np.sin(-yaw0 + np.pi / 2)
+
+    for idx, ep in enumerate(ego_pose_seq):
+        if ep is None:
+            continue
+        dx, dy = ep.x - ref_x, ep.y - ref_y
+        transformed[idx] = (
+            cos_a * dx - sin_a * dy,
+            sin_a * dx + cos_a * dy,
+        )
+    return transformed
         
 if __name__ == "__main__":
     import glob
     import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
     from torch.utils.data import DataLoader
-    from .collator import CollateNuplan, sample_dict_to_nuplan_frame
-    from .utils.coordinate_transform import transform_ego_trajectory_local
 
     db_paths = glob.glob("./nuplan_dataset/data/**/*.db", recursive=True)
-
 
     dataset = NuplanDataset(
         db_paths,
         meta_keys=(MetaKey.EGO_POSE,),
         image_root="./nuplan_dataset",
-        nclips=2,
-        fpcs=16,
+        fpcs=32,
         duration_s=10.0,
         random_jiggle_part=True,
     )
     print(f"Total samples: {len(dataset)}")
 
-    def collate_nuplan(batch):
-        """Convenience wrapper around :class:`CollateNuplan` for use as a plain function."""
-        return CollateNuplan()(batch)
-    loader = DataLoader(dataset, 4, shuffle = False, collate_fn = collate_nuplan, num_workers = 4, persistent_workers = True)
+    loader = DataLoader(dataset, 4, shuffle = False, collate_fn = collate_nuplan, num_workers = 4, persistent_workers = True, pin_memory = False)
 
     frames: NuplanFrame
     images: torch.Tensor
     for frames, images in loader:
-        print(images.shape)
-        print((frames.frame_timestamps[:, -1] - frames.frame_timestamps[:, 0]) * 1e-6)
-    
-    state = {
-        "sample_idx": 0,
-        "clip_idx": 0,
-        "num_clips": 1,
-        "frame_idx": 0,
-        "frame": None,
-        "images": None,
-    }
+        break
 
-    def load_sample(idx, clip_idx=0):
+    state = {"sample_idx": 0, "frame_idx": 0, "frame": None, "images": None}
+
+    def load_sample(idx):
         result = dataset[idx]
         if result is None:
-            return None, None, 0
+            return None, None
         if isinstance(result, dict):
-            if "clips" in result:
-                clips = result.get("clips") or []
-                if not clips:
-                    return None, None, 0
-                cidx = max(0, min(int(clip_idx), len(clips) - 1))
-                clip = clips[cidx]
-                return sample_dict_to_nuplan_frame(clip), clip.get("images"), len(clips)
-            return sample_dict_to_nuplan_frame(result), result.get("images"), 1
-        frame, images = result
-        return frame, images, 1
+            return sample_dict_to_nuplan_frame(result), result.get("images")
+        return result
 
     def render():
         fig.clf()
@@ -742,8 +863,6 @@ if __name__ == "__main__":
         images = state["images"]
         fidx = state["frame_idx"]
         sidx = state["sample_idx"]
-        cidx = state["clip_idx"]
-        nclips = state["num_clips"]
 
         if images is not None and len(images) > 0:
             fidx = max(0, min(fidx, len(images) - 1))
@@ -756,9 +875,9 @@ if __name__ == "__main__":
             n_frames = 0
 
         ax_img.set_title(
-            f"sample {sidx + 1}/{len(dataset)}  clip {cidx + 1}/{max(1, nclips)}  frame {fidx + 1}/{n_frames}  "
+            f"sample {sidx + 1}/{len(dataset)}  frame {fidx + 1}/{n_frames}  "
             f"fpcs={dataset.fpcs}  duration={dataset.duration_s}s\n"
-            "Left/Right: frame  [/]: clip  Up/Down: sample  R: resample  Q: quit",
+            "Left/Right: frame  Up/Down: sample  R: resample  Q: quit",
             fontsize=8,
         )
         ax_img.axis("off")
@@ -803,15 +922,13 @@ if __name__ == "__main__":
         fig.tight_layout()
         fig.canvas.draw_idle()
 
-    state["frame"], state["images"], state["num_clips"] = load_sample(0, 0)
+    state["frame"], state["images"] = load_sample(0)
 
     fig = plt.figure(figsize=(14, 6))
 
     def on_key(event):
         fidx = state["frame_idx"]
         sidx = state["sample_idx"]
-        cidx = state["clip_idx"]
-        nclips = state["num_clips"]
         images = state["images"]
         n = len(images) if images is not None else 0
 
@@ -821,25 +938,15 @@ if __name__ == "__main__":
             state["frame_idx"] = (fidx - 1) % max(n, 1)
         elif event.key == "up":
             state["sample_idx"] = (sidx - 1) % len(dataset)
-            state["clip_idx"] = 0
             state["frame_idx"] = 0
-            state["frame"], state["images"], state["num_clips"] = load_sample(state["sample_idx"], state["clip_idx"])
+            state["frame"], state["images"] = load_sample(state["sample_idx"])
         elif event.key == "down":
             state["sample_idx"] = (sidx + 1) % len(dataset)
-            state["clip_idx"] = 0
             state["frame_idx"] = 0
-            state["frame"], state["images"], state["num_clips"] = load_sample(state["sample_idx"], state["clip_idx"])
-        elif event.key in ("]", "n"):
-            state["clip_idx"] = (cidx + 1) % max(1, nclips)
-            state["frame_idx"] = 0
-            state["frame"], state["images"], state["num_clips"] = load_sample(state["sample_idx"], state["clip_idx"])
-        elif event.key in ("[", "p"):
-            state["clip_idx"] = (cidx - 1) % max(1, nclips)
-            state["frame_idx"] = 0
-            state["frame"], state["images"], state["num_clips"] = load_sample(state["sample_idx"], state["clip_idx"])
+            state["frame"], state["images"] = load_sample(state["sample_idx"])
         elif event.key == "r":
             state["frame_idx"] = 0
-            state["frame"], state["images"], state["num_clips"] = load_sample(state["sample_idx"], state["clip_idx"])
+            state["frame"], state["images"] = load_sample(state["sample_idx"])
         elif event.key in ("q", "escape"):
             plt.close("all")
             return
@@ -848,4 +955,3 @@ if __name__ == "__main__":
     fig.canvas.mpl_connect("key_press_event", on_key)
     render()
     plt.show()
-    

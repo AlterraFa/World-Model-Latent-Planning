@@ -121,6 +121,8 @@ train:
   pin_mem: true
   datasets_path: []
 
+model: {{}}
+
 data_aug: {{}}
 
 loss: {{}}
