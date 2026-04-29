@@ -3,7 +3,7 @@ app: latent_dreaming
 common: &common_settings
   patch_size: 16
   tubelet_size: 2
-  crop_size: 224
+  crop_size: 288
   fpcs: 16
 
 train:
@@ -15,33 +15,36 @@ train:
   datasets_path: []
 
 model: 
-  timescale: 1.0
+  target: models.diffusion_wm.DiffusionWM
+  params:
+    compile: true
+    timescale: 1.0
 
-  encoder:
-    <<: *common_settings
-    name: vjepa2_1_vit_base_384
-    load_from: facebookresearch/vjepa2
-    source: github
-    use_sdpa: true
-    use_rope: true
-    use_activation_checkpointing: true
+    encoder_config:
+      <<: *common_settings
+      name: vjepa2_1_vit_base_384
+      load_from: facebookresearch/vjepa2
+      source: github
+      use_sdpa: true
+      use_rope: true
+      use_activation_checkpointing: true
 
-  diffuser:
-    target: networks.DiT.dit.STDiT
-    params:
-      max_num_frames: 64
-      diffuse_dim: &diffuse_dim 512
-      depth: 24
-      num_heads: 16
-      mlp_ratio: 4
-      input_size:
-      - ${div:${common.crop_size}, ${common.patch_size}}
-      - ${div:${common.crop_size}, ${common.patch_size}}
-      patch_size: 1
-      dropout: 0.0
-      ctx_noise_aug_ratio: 0.1
-      ctx_noise_aug_prob: 0.5
-      drop_ctx_rate: 0.1
+    diffuser_config:
+      target: networks.DiT.dit.STDiT
+      params:
+        max_num_frames: 64
+        diffuse_dim: &diffuse_dim 512
+        depth: 24
+        num_heads: 16
+        mlp_ratio: 4
+        input_size:
+        - ${div:${common.crop_size}, ${common.patch_size}}
+        - ${div:${common.crop_size}, ${common.patch_size}}
+        patch_size: 1
+        dropout: 0.0
+        ctx_noise_aug_ratio: 0.1
+        ctx_noise_aug_prob: 0.5
+        drop_ctx_rate: 0.1
 
 data_aug: {}
 
@@ -49,8 +52,21 @@ loss: {}
 
 optimization: {}
 
-meta: {}
+meta:
+  save_root_dir: ./Experiment
+  dtype: bfloat16
+  save_every_freq: 5
+  seed: 239
+  sync_gc: true
 
-checkpoint: {}
+checkpoint:
+  patience: 10
+  min_delta: 0.0005
 
-logging: {}
+logging: 
+  progress_type: table
+  save_csv: true
+  save_batch_csv: true
+  save_epoch_csv: true
+  log_batch_tensorboard: true
+  log_model_graph: true

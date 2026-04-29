@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
+from omegaconf import OmegaConf
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from utils.distributed import all_gather, all_reduce
@@ -139,4 +140,74 @@ def loss_registry(name):
     return decorator
 
 def main(args: dict, yaml_path: str):
-    pass
+    OmegaConf.register_new_resolver("div", lambda x, y: int(x / y))
+    OmegaConf.resolve(args) 
+    
+    model_cfg = args.get('model', {})
+    
+    training_cfg = args.get('train', {})
+    
+    augment_cfg = args.get('data_aug', {})
+    
+    loss_cfg = args.get('loss', {})
+    
+    optim_cfg = args.get('optimization', {})
+    anneal       = optim_cfg.get('anneal', 15)
+    num_epochs   = optim_cfg.get('epochs', 100)
+    final_lr     = optim_cfg.get('final_lr', 0.0)
+    final_wd     = optim_cfg.get("final_weight_decay", 0.0)
+    ipe          = optim_cfg.get('ipe', 100)
+    lr           = optim_cfg.get('lr', 1e-3)
+    start_lr     = optim_cfg.get('start_lr', 1e-3)
+    warmup       = optim_cfg.get('warmup', 10)
+    weight_decay = optim_cfg.get('weight_decay', 0.0)
+    betas        = optim_cfg.get('betas', (0.9, 0.999))
+    eps          = optim_cfg.get('eps', 1.0e-8)
+    ema          = optim_cfg.get('ema', [0.9, 1.0])
+    
+    meta_cfg = args.get("meta", {})
+    dtype              = meta_cfg.get('dtype', 'float32')
+    save_freq          = meta_cfg.get('save_every_freq', 2)
+    seed               = meta_cfg.get('seed', 0)
+    sync_gc            = meta_cfg.get('sync_gc', False)
+    save_root_dir      = meta_cfg.get('save_root_dir', "./")
+    continue_from_path = meta_cfg.get('continue_from_path', None)
+    continue_train          = bool(continue_from_path)
+    resume_prefer_best      = bool(meta_cfg.get('resume_prefer_best', True))
+    
+    ckpt_cfg = args.get('checkpoint', {})
+    patience = ckpt_cfg.get('patience', num_epochs)
+    min_delta = ckpt_cfg.get('min_delta', 0.0)
+    
+    logging_cfg = args.get('logging', {})
+    progress_type         = logging_cfg.get('progress_type', 'table')
+    save_csv              = logging_cfg.get('save_csv', True)
+    save_batch_csv        = logging_cfg.get('save_batch_csv', False)
+    save_epoch_csv        = logging_cfg.get('save_epoch_csv', True)
+    log_batch_tensorboard = logging_cfg.get('log_batch_tensorboard', False)
+    log_model_graph       = logging_cfg.get('log_model_graph', False)
+
+    torch.manual_seed(seed)
+    world_size, rank = init_distributed()
+    if dist.is_available() and dist.is_initialized() and world_size > 1:
+        logger.CUSTOM("SUCCESS", f"DDP enabled (world_size={world_size}, rank={rank})")
+    else:
+        logger.INFO("DDP disabled (single-GPU/single-process mode)")
+
+    # =================== DTYPE SELECTION =================== #
+    if dtype.lower() == "bfloat16":
+        dtype = torch.bfloat16
+        mixed_precision = True
+    elif dtype.lower() == "float16":
+        dtype = torch.float16
+        mixed_precision = True
+    else:
+        dtype = torch.float32
+        mixed_precision = False
+    # =================== DTYPE SELECTION =================== #
+
+    # =================== INIT WORLD MODEL =================== #
+    device_type = f'cuda:{rank}'
+    device = torch.device(device_type)
+    compile_model(model_cfg, device = device)
+    # =================== INIT WORLD MODEL =================== #

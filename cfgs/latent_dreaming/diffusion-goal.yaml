@@ -3,7 +3,7 @@ app: latent_dreaming
 common: &common_settings
   patch_size: 16
   tubelet_size: 2
-  crop_size: 224
+  crop_size: 288
   fpcs: 16
 
 train:
@@ -15,49 +15,78 @@ train:
   datasets_path: []
 
 model: 
-  timescale: 1.0
-  goal_drop: 0.0
+  target: models.diffusion_goal.DiffusionGoal
+  params:
+    compile: true
+    timescale: 1.0
+    goal_drop: 0.0
 
-  encoder:
-    <<: *common_settings
-    name: vjepa2_1_vit_base_384
-    load_from: facebookresearch/vjepa2
-    source: github
-    use_sdpa: true
-    use_rope: true
-    use_activation_checkpointing: true
+    encoder_config:
+      <<: *common_settings
+      name: vjepa2_1_vit_base_384
+      load_from: facebookresearch/vjepa2
+      source: github
+      use_sdpa: true
+      use_rope: true
+      use_activation_checkpointing: true
 
-  diffuser:
-    target: networks.DiT.dit_steering.STDiTGoalConditioned
-    params:
-      max_num_frames: 64
-      diffuse_dim: &diffuse_dim 512
-      depth: 24
-      num_heads: 16
-      mlp_ratio: 4
-      input_size:
-      - ${div:${common.crop_size}, ${common.patch_size}}
-      - ${div:${common.crop_size}, ${common.patch_size}}
-      patch_size: 1
-      dropout: 0.0
-      ctx_noise_aug_ratio: 0.1
-      ctx_noise_aug_prob: 0.5
-      drop_ctx_rate: 0.1
-      steering_config:
-        target: networks.DiT.dit_steering.LinearGoalEmbedder
-        params:
-          num_input_features: 2
-          hidden_size: *diffuse_dim
+    diffuser_config:
+      target: networks.DiT.dit_steering.STDiTGoalConditioned
+      params:
+        max_num_frames: 64
+        diffuse_dim: &diffuse_dim 512
+        depth: 16
+        num_heads: 16
+        mlp_ratio: 4
+        input_size:
+        - ${div:${common.crop_size}, ${common.patch_size}}
+        - ${div:${common.crop_size}, ${common.patch_size}}
+        patch_size: 1
+        dropout: 0.0
+        ctx_noise_aug_ratio: 0.1
+        ctx_noise_aug_prob: 0.5
+        drop_ctx_rate: 0.1
+        steering_config:
+          target: networks.DiT.dit_steering.LinearGoalEmbedder
+          params:
+            num_input_features: 2
+            hidden_size: *diffuse_dim
 
 
-data_aug: {}
+data_aug: 
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 1.0
+  - 1.777
+  reprob: 0.0
+  normalize: 
+  - [0.485, 0.456, 0.406]
+  - [0.229, 0.224, 0.225]
 
 loss: {}
 
 optimization: {}
 
-meta: {}
+meta:
+  save_root_dir: ./Experiment
+  dtype: bfloat16
+  save_every_freq: 5
+  seed: 239
+  sync_gc: true
 
-checkpoint: {}
+checkpoint:
+  patience: 10
+  min_delta: 0.0005
 
-logging: {}
+logging: 
+  progress_type: table
+  save_csv: true
+  save_batch_csv: true
+  save_epoch_csv: true
+  log_batch_tensorboard: true
+  log_model_graph: true

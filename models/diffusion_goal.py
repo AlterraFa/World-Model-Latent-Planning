@@ -8,8 +8,8 @@ from tqdm.auto import tqdm
 from .diffusion_wm import DiffusionWM, add_noise, A_, B_, alpha, sigma
 
 class DiffusionGoal(DiffusionWM):
-    def __init__(self, *, generator_config, encoder_config, timescale=1, goal_drop=0.0):
-        super().__init__(generator_config=generator_config, encoder_config=encoder_config, timescale=timescale)
+    def __init__(self, *, diffuser_config, encoder_config, compile = False, timescale=1, goal_drop=0.0):
+        super().__init__(diffuser_config=diffuser_config, encoder_config=encoder_config, compile = compile, timescale=timescale)
         self.goal_drop = goal_drop
 
     def drop_goal(self, goal):
@@ -32,14 +32,20 @@ class DiffusionGoal(DiffusionWM):
         n_ctx_frames = T
         x_c = self.encode_frames(images)
         
-        x_all = x_c.clone()
+        x_all = [x_c.clone()]
         if goal is None:
             goal = torch.full((images.shape[0], 2), torch.nan, device = images.device)
 
         num_steps = math.ceil(n_hallucination // chunk_gen)
         for idx in tqdm(range(num_steps)):
         
-            self.sample(z = x_c, chunk_gen = chunk_gen, goal = goal, NFE = NFE, eta = eta, frame_rate = None)
+            x_last_t = self.sample(z = x_c, chunk_gen = chunk_gen, goal = goal, NFE = NFE, eta = eta, frame_rate = None)
+            x_all.append(x_last_t)
+            x_c = torch.cat([x_c[:, chunk_gen:], x_last_t], dim = 1)
+        
+        x_all = torch.cat(x_all, dim=1)[:, :chunk_gen+n_hallucination]
+
+        return x_all
         
     @torch.no_grad()    
     def sample(self, z: torch.Tensor, chunk_gen: int, goal: torch.Tensor, eta = 0.0, NFE = 20, frame_rate = None):
@@ -76,7 +82,7 @@ if __name__ == "__main__":
     OmegaConf.register_new_resolver("div", lambda x, y: int(x / y))
     model_cfg = cfg['model']
     
-    model = DiffusionGoal(generator_config = model_cfg['diffuser'], encoder_config = model_cfg['encoder'], timescale = model_cfg['timescale'], goal_drop = model_cfg['goal_drop']).to(device)
+    model = DiffusionGoal(diffuser_config = model_cfg['diffuser'], encoder_config = model_cfg['encoder'], timescale = model_cfg['timescale'], goal_drop = model_cfg['goal_drop']).to(device)
     
     common_cfg = cfg['common']
     B = 1
@@ -98,4 +104,4 @@ if __name__ == "__main__":
         # velocity = A_(t) * z_target + B_(t) * noise
         
         # loss = ((pred.float() - velocity.float()) ** 2).mean()
-        model.roll_out(inp, n_hallucination = 25, chunk_gen = 25)
+        model.roll_out(inp, n_hallucination = 25, chunk_gen = 5)

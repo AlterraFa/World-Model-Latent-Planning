@@ -8,13 +8,17 @@ from omegaconf import ListConfig
 from utils.autoload_modules import instantiate_from_config
 
 class DiffusionWM(nn.Module):
-    def __init__(self, *, generator_config, encoder_config, timescale = 1.0):
+    def __init__(self, *, diffuser_config, encoder_config, timescale = 1.0, compile = False):
         super().__init__()
 
         self.encoder = self._load_encoder(encoder_config)
-        generator_config['params']['embed_dim'] = self.encoder.embed_dim
-        self.diffuser = self._build_defuser(generator_config)
+        diffuser_config['params']['embed_dim'] = self.encoder.embed_dim
+        self.diffuser = self._build_defuser(diffuser_config)
         self.timescale = timescale
+
+        if compile:
+            self.encoder.compile(mode = "reduce-overhead", dynamic = True)
+            self.diffuser.compile(mode = "reduce-overhead", dynamic = True)
         
     def _build_defuser(self, config) -> nn.Module:
         return instantiate_from_config(config)
@@ -149,7 +153,7 @@ if __name__ == "__main__":
     OmegaConf.register_new_resolver("div", lambda x, y: int(x / y))
     model_cfg = cfg['model']
     
-    model = DiffusionWM(generator_config = model_cfg['diffuser'], encoder_config = model_cfg['encoder']).to(device)
+    model = DiffusionWM(diffuser_config = model_cfg['diffuser'], encoder_config = model_cfg['encoder']).to(device)
     
     common_cfg = cfg['common']
     B = 2
