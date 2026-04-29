@@ -17,7 +17,9 @@ wheels/
 *.pt
 *.engine
 
-# Image files
+# Image files and dataset
+.cache/
+nuplan_dataset
 *.jpg
 *.png
 *.jpeg
