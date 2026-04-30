@@ -111,6 +111,7 @@ class CollateNuplan:
         return batched_frame, stacked_images
 
 
+
 def ego_pose_array_to_list(ego_pose_arr, frame_ts):
     if ego_pose_arr is None:
         return []
