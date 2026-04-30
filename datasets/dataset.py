@@ -94,7 +94,7 @@ class NuplanDataset(Dataset):
         self.shared_transform = shared_transform
         self.n_clips = max(1, int(n_clips))
         self.allow_clip_overlap = allow_clip_overlap
-        self._local = threading.local()
+        self._local_storage = None 
         self._log_time_cache = {}
 
         self._log_dirs: dict = {}
@@ -131,6 +131,11 @@ class NuplanDataset(Dataset):
             os.makedirs(os.path.dirname(_cache_path), exist_ok=True)
             with open(_cache_path, "wb") as _f:
                 pickle.dump((_db_set, self.samples, self._log_time_cache), _f)
+    @property
+    def _local(self):
+        if self._local_storage is None:
+            self._local_storage = threading.local()
+        return self._local_storage
 
     # ------------------------------------------------------------------
     # Image path resolution
@@ -146,9 +151,11 @@ class NuplanDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _get_conn(self, db_path):
+        # Accessing self._local here triggers the @property above
         if not hasattr(self._local, "conns"):
             self._local.conns = {}
         if db_path not in self._local.conns:
+            # check_same_thread=False is important for SQLite in multi-threaded envs
             con = sqlite3.connect(db_path, check_same_thread=False)
             con.row_factory = sqlite3.Row
             self._local.conns[db_path] = con
@@ -756,187 +763,3 @@ def sample_dict_to_nuplan_frame(sample):
         scene_name=meta.get("scene_name", ""),
         roadblock_ids=meta.get("roadblock_ids", []),
     )
-
-
-def quaternion_yaw(qw, qx, qy, qz):
-    """Compute yaw (heading) from quaternion components."""
-    return np.arctan2(
-        2.0 * (qw * qz + qx * qy),
-        1.0 - 2.0 * (qy ** 2 + qz ** 2),
-    )
-
-
-def transform_ego_trajectory_local(ego_pose_seq):
-    """Project global ego poses into a local frame.
-
-    Local frame convention:
-      - origin at first valid pose
-      - +y aligned with first valid pose heading
-
-    Returns a list with the same length as ego_pose_seq where missing poses
-    are kept as None and valid poses are (x_local, y_local) tuples.
-    """
-    if not ego_pose_seq:
-        return []
-
-    transformed = [None] * len(ego_pose_seq)
-    first_idx = next((i for i, ep in enumerate(ego_pose_seq) if ep is not None), None)
-    if first_idx is None:
-        return transformed
-
-    ep0 = ego_pose_seq[first_idx]
-    ref_x, ref_y = ep0.x, ep0.y
-    yaw0 = quaternion_yaw(ep0.qw, ep0.qx, ep0.qy, ep0.qz)
-    cos_a, sin_a = np.cos(-yaw0 + np.pi / 2), np.sin(-yaw0 + np.pi / 2)
-
-    for idx, ep in enumerate(ego_pose_seq):
-        if ep is None:
-            continue
-        dx, dy = ep.x - ref_x, ep.y - ref_y
-        transformed[idx] = (
-            cos_a * dx - sin_a * dy,
-            sin_a * dx + cos_a * dy,
-        )
-    return transformed
-        
-if __name__ == "__main__":
-    import glob
-    import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
-    from torch.utils.data import DataLoader
-    from .collator import CollateNuplan
-
-    db_paths = glob.glob("./nuplan_dataset/data/**/*.db", recursive=True)
-
-    dataset = NuplanDataset(
-        db_paths,
-        meta_keys=(MetaKey.EGO_POSE,),
-        image_root="./nuplan_dataset",
-        fpcs=16,
-        duration_s=10.0,
-        n_clips = 1,
-        allow_clip_overlap = True,
-        random_jiggle_part=True,
-    )
-    print(f"Total samples: {len(dataset)}")
-
-    loader = DataLoader(dataset, 4, shuffle = False, collate_fn = CollateNuplan(), num_workers = 4, persistent_workers = True, pin_memory = False)
-
-    frames: NuplanFrame
-    images: torch.Tensor
-    for frames, images in loader:
-        print(frames.ego_pose.shape)
-        break
-
-    state = {"sample_idx": 0, "frame_idx": 0, "frame": None, "images": None}
-
-    def load_sample(idx):
-        result = dataset[idx]
-        if result is None:
-            return None, None
-        if isinstance(result, dict):
-            return sample_dict_to_nuplan_frame(result), result.get("images")
-        return result
-
-    def render():
-        fig.clf()
-        gs = gridspec.GridSpec(1, 2, figure=fig, width_ratios=[2, 1])
-        ax_img = fig.add_subplot(gs[0])
-        ax_traj = fig.add_subplot(gs[1])
-
-        frame = state["frame"]
-        images = state["images"]
-        fidx = state["frame_idx"]
-        sidx = state["sample_idx"]
-
-        if images is not None and len(images) > 0:
-            fidx = max(0, min(fidx, len(images) - 1))
-            state["frame_idx"] = fidx
-            ax_img.imshow(images[fidx])
-            n_frames = len(images)
-        else:
-            ax_img.text(0.5, 0.5, "No frames decoded", ha="center", va="center",
-                        transform=ax_img.transAxes, color="red", fontsize=14)
-            n_frames = 0
-
-        ax_img.set_title(
-            f"sample {sidx + 1}/{len(dataset)}  frame {fidx + 1}/{n_frames}  "
-            f"fpcs={dataset.fpcs}  duration={dataset.duration_s}s\n"
-            "Left/Right: frame  Up/Down: sample  R: resample  Q: quit",
-            fontsize=8,
-        )
-        ax_img.axis("off")
-
-        if frame is not None and frame.ego_pose:
-            pts_by_frame = transform_ego_trajectory_local(frame.ego_pose)
-            pts = [p for p in pts_by_frame if p is not None]
-            if pts:
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                n = len(xs)
-
-                colors = plt.cm.plasma(np.linspace(0, 1, n))
-                for i in range(n - 1):
-                    ax_traj.plot(xs[i:i+2], ys[i:i+2], color=colors[i], linewidth=2)
-                ax_traj.scatter(xs, ys, c=np.linspace(0, 1, n), cmap="plasma", s=40, zorder=5)
-
-                # First frame marker at origin (bottom center)
-                ax_traj.scatter([0], [0], color="lime", s=180, zorder=10, marker="^", label="first")
-
-                # Current frame marker (static highlight, plot doesn't move)
-                if fidx < len(pts_by_frame) and pts_by_frame[fidx] is not None:
-                    cx, cy = pts_by_frame[fidx]
-                    ax_traj.scatter([cx], [cy], color="cyan",
-                                    s=180, zorder=11, marker="*", label=f"frame {fidx+1}")
-
-                ax_traj.legend(fontsize=8)
-
-                # First frame at bottom center: keep x static and extend y upward.
-                y_max = max(max(ys), 1)
-                y_min = min(min(ys), 0)
-                y_pad = max(0.5, (y_max - y_min) * 0.1)
-                ax_traj.set_xlim(-10.0, 10.0)
-                ax_traj.set_ylim(y_min - y_pad, y_max + y_pad)
-
-        ax_traj.set_title("Ego trajectory (first frame = origin, heading = up)", fontsize=9)
-        ax_traj.set_xlabel("Δx (m)")
-        ax_traj.set_ylabel("Δy (m)")
-        ax_traj.set_aspect("equal")
-        ax_traj.grid(True, alpha=0.3)
-
-        fig.tight_layout()
-        fig.canvas.draw_idle()
-
-    state["frame"], state["images"] = load_sample(0)
-
-    fig = plt.figure(figsize=(14, 6))
-
-    def on_key(event):
-        fidx = state["frame_idx"]
-        sidx = state["sample_idx"]
-        images = state["images"]
-        n = len(images) if images is not None else 0
-
-        if event.key in ("right", "d"):
-            state["frame_idx"] = (fidx + 1) % max(n, 1)
-        elif event.key in ("left", "a"):
-            state["frame_idx"] = (fidx - 1) % max(n, 1)
-        elif event.key == "up":
-            state["sample_idx"] = (sidx - 1) % len(dataset)
-            state["frame_idx"] = 0
-            state["frame"], state["images"] = load_sample(state["sample_idx"])
-        elif event.key == "down":
-            state["sample_idx"] = (sidx + 1) % len(dataset)
-            state["frame_idx"] = 0
-            state["frame"], state["images"] = load_sample(state["sample_idx"])
-        elif event.key == "r":
-            state["frame_idx"] = 0
-            state["frame"], state["images"] = load_sample(state["sample_idx"])
-        elif event.key in ("q", "escape"):
-            plt.close("all")
-            return
-        render()
-
-    fig.canvas.mpl_connect("key_press_event", on_key)
-    render()
-    plt.show()
