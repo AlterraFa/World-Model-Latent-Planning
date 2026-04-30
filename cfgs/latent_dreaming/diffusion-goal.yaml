@@ -3,16 +3,23 @@ app: latent_dreaming
 common: &common_settings
   patch_size: 16
   tubelet_size: 2
-  crop_size: 288
+  crop_size: &crop_size 288
   fpcs: 16
 
-train:
-  <<: *common_settings
+loader:
   batch_size: 20
   num_workers: 4
   persistent_workers: true
   pin_mem: true
-  datasets_path: []
+  dataset_config:
+    <<: *common_settings
+    n_clips: 1
+    duration: 10.0
+    random_jiggle_part: true
+    allow_overlap: true
+    random_jiggle: true
+    channel: "F0"
+    datasets_root: "./nuplan_dataset/"
 
 model: 
   target: models.diffusion_goal.DiffusionGoal
@@ -67,10 +74,27 @@ data_aug:
   normalize: 
   - [0.485, 0.456, 0.406]
   - [0.229, 0.224, 0.225]
+  crop_size: *crop_size
 
 loss: {}
 
-optimization: {}
+optimization:
+  ema:
+    - 0.99925
+    - 0.99925
+  ipe: 150
+  anneal: 30
+  epochs: 50
+  warmup: 10
+  learning_rate:
+    scale: 1.0
+    start: 4.5e-05
+    ref: 0.000125
+    end: 0.0
+  weight_decay:
+    exclude: true
+    start: 0.04
+    end: 0.015
 
 meta:
   save_root_dir: ./Experiment

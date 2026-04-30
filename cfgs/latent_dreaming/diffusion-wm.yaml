@@ -6,13 +6,20 @@ common: &common_settings
   crop_size: 288
   fpcs: 16
 
-train:
-  <<: *common_settings
+loader:
   batch_size: 20
   num_workers: 4
   persistent_workers: true
   pin_mem: true
-  datasets_path: []
+  dataset_config:
+    <<: *common_settings
+    n_clips: 1
+    duration: 10.0
+    random_jiggle_part: true
+    allow_overlap: true
+    random_jiggle: true
+    channel: "F0"
+    datasets_root: "./nuplan_dataset/"
 
 model: 
   target: models.diffusion_wm.DiffusionWM
@@ -50,7 +57,23 @@ data_aug: {}
 
 loss: {}
 
-optimization: {}
+optimization:
+  ema:
+    - 0.99925
+    - 0.99925
+  ipe: 150
+  anneal: 30
+  epochs: 50
+  warmup: 10
+  learning_rate:
+    scale: 1.0
+    start: 4.5e-05
+    ref: 0.000125
+    end: 0.0
+  weight_decay:
+    exclude: true
+    start: 0.04
+    end: 0.015
 
 meta:
   save_root_dir: ./Experiment
