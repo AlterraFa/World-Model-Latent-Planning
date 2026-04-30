@@ -17,8 +17,10 @@ class DiffusionWM(nn.Module):
         self.timescale = timescale
 
         if compile:
+            print("COMPILING MODEL USING `reduce-overhead`")
             self.encoder.compile(mode = "reduce-overhead", dynamic = True)
             self.diffuser.compile(mode = "reduce-overhead", dynamic = True)
+            print("FINISHED COMPILE")
         
     def _build_defuser(self, config) -> nn.Module:
         return instantiate_from_config(config)
