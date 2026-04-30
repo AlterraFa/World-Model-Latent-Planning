@@ -24,7 +24,7 @@ loader:
 model: 
   target: models.diffusion_wm.DiffusionWM
   params:
-    compile: true
+    compile: false
     timescale: 1.0
 
     encoder_config:
@@ -91,5 +91,5 @@ logging:
   save_csv: true
   save_batch_csv: true
   save_epoch_csv: true
-  log_batch_tensorboard: true
   log_model_graph: true
+  use_wandb: true

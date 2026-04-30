@@ -3,11 +3,11 @@ app: latent_dreaming
 common: &common_settings
   patch_size: 16
   tubelet_size: 2
-  crop_size: &crop_size 288
-  fpcs: 16
+  crop_size: &crop_size 224
+  fpcs: 32
 
 loader:
-  batch_size: 20
+  batch_size: 8
   num_workers: 4
   persistent_workers: true
   pin_mem: true
@@ -24,7 +24,7 @@ loader:
 model: 
   target: models.diffusion_goal.DiffusionGoal
   params:
-    compile: true
+    compile: false
     timescale: 1.0
     goal_drop: 0.0
 
@@ -76,7 +76,8 @@ data_aug:
   - [0.229, 0.224, 0.225]
   crop_size: *crop_size
 
-loss: {}
+loss:
+  context_length: 2 #-- seconds
 
 optimization:
   ema:
