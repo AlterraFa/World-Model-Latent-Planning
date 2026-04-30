@@ -2,9 +2,10 @@ import os, sys
 import resource
 import time
 import gc
-from ruamel.yaml import YAML
-from functools import partial
 from pathlib import Path
+from omegaconf import OmegaConf, DictConfig, ListConfig
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 project_root = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(project_root))
@@ -96,15 +97,17 @@ def load_ckpt(
 
     return models_dict, optimizer, scaler, start_epoch + 1, score, best_loss
 
+
 def save_config_pretty(config_dict, save_path):
+    # 1. Convert OmegaConf to a plain dict first
+    # resolve=True handles any ${interpolation} keys
+    if isinstance(config_dict, (DictConfig, ListConfig)):
+        config_dict = OmegaConf.to_container(config_dict, resolve=True)
+
     yaml = YAML()
-    # Basic formatting
     yaml.indent(mapping=2, sequence=4, offset=2)
     yaml.preserve_quotes = True
     yaml.default_flow_style = False
-    
-    # This turns the dict into a 'ruamel' internal dict that supports comments/spacing
-    from ruamel.yaml.comments import CommentedMap
     
     def dict_to_commented(d):
         if isinstance(d, dict):
@@ -112,14 +115,17 @@ def save_config_pretty(config_dict, save_path):
             for k, v in d.items():
                 cm[k] = dict_to_commented(v)
             return cm
+        elif isinstance(d, list):
+            return [dict_to_commented(i) for i in d]
         return d
 
     pretty_data = dict_to_commented(config_dict)
 
-    # Add a blank line before every top-level key for readability
+    # Now pretty_data is definitely a CommentedMap, so this will work
     first = True
     for key in pretty_data.keys():
         if not first:
+            # This method belongs to ruamel.yaml, and now it exists
             pretty_data.yaml_set_comment_before_after_key(key, before='\n')
         first = False
 
@@ -145,9 +151,16 @@ def main(args: dict, yaml_path: str):
     
     model_cfg = args.get('model', {})
     
-    training_cfg = args.get('train', {})
+    loader_cfg = args.get('loader', {})
     
     augment_cfg = args.get('data_aug', {})
+    auto_augment        = augment_cfg.get('auto_augment', False)
+    horizontal_flip     = augment_cfg.get('horizontal_flip', False)
+    motion_shift        = augment_cfg.get('motion_shift', False)
+    random_aspect_ratio = augment_cfg.get('random_resize_aspect_ratio', (1.0, 1.0))
+    random_resize_scale = augment_cfg.get('random_resize_scale', (1.0, 1.0))
+    reprob              = augment_cfg.get('reprob', 0.0)
+    crop_size           = augment_cfg.get('crop_size', 244)
     
     loss_cfg = args.get('loss', {})
     
@@ -209,5 +222,131 @@ def main(args: dict, yaml_path: str):
     # =================== INIT WORLD MODEL =================== #
     device_type = f'cuda:{rank}'
     device = torch.device(device_type)
-    compile_model(model_cfg, device = device)
+    world_model, ema_wm = compile_model(model_cfg, device = device)
     # =================== INIT WORLD MODEL =================== #
+    
+    # =================== INIT LOADER AND TRANSFORM =================== #
+    transforms = compile_transform(
+        random_horizontal_flip     = horizontal_flip,
+        random_resize_aspect_ratio = random_aspect_ratio,
+        random_resize_scale        = random_resize_scale,
+        reprob       = reprob,
+        auto_augment = auto_augment,
+        motion_shift = motion_shift,
+        crop_size    = crop_size,
+    )
+
+    dataloader, sampler = compile_dataloader(
+        train_cfg = loader_cfg,
+        transform = transforms,
+        world_sz  = world_size,
+        rank      = rank
+    )
+    # =================== INIT LOADER AND TRANSFORM =================== #
+    
+    
+    # =================== INIT 5 OPTIMIZER =================== #
+    optim, scaler, lr_scheduler, wd_scheduler, ema_scheduler = compile_opt(
+        model = world_model,
+        optim_config = optim_cfg,
+        mixed_precision = mixed_precision
+    )
+    # =================== INIT 5 OPTIMIZER =================== #
+
+    app_name = __name__.split(".")[1]
+    beaut_name = f"{' '.join(app_name.split('_')).title()}"
+    log_dir = os.path.join(save_root_dir, app_name)
+    logger.INFO(f"[i][u]{beaut_name}[/][/] save root directory: {log_dir}")
+
+
+    continue_run_dir = None
+    continue_run_name = None
+    if continue_train:
+        continue_run_dir = os.path.abspath(os.path.expanduser(continue_from_path))
+        if os.path.basename(continue_run_dir) == "weights":
+            continue_run_dir = os.path.dirname(continue_run_dir)
+        if not os.path.isdir(continue_run_dir):
+            raise FileNotFoundError(f"continue_from_path does not exist: {continue_from_path}")
+        continue_run_name = os.path.basename(continue_run_dir)
+        if not continue_run_name.startswith("run"):
+            raise ValueError(
+                f"Expected continue_from_path to point to a run directory like '.../run1', got: {continue_run_dir}"
+            )
+            
+    if rank == 0:
+        if continue_train:
+            resolved_run_idx = int(continue_run_name.removeprefix("run"))
+            logger.INFO(f"Resuming requested. Selected run directory: {continue_run_dir}")
+        else:
+            resolved_run_idx = get_next_run(log_dir)
+        run_idx_tensor = torch.tensor([resolved_run_idx], dtype=torch.long, device=device)
+    else:
+        run_idx_tensor = torch.tensor([0], dtype=torch.long, device=device)
+
+    if dist.is_initialized() and world_size > 1:
+        dist.broadcast(run_idx_tensor, src=0)
+    run_idx = int(run_idx_tensor.item())
+
+    start_epoch = 0
+    resume_score = None
+    resume_best_loss = None
+    run_name = f"run{run_idx}"
+    run_dir = os.path.join(log_dir, run_name)
+
+    if continue_train and continue_run_dir is not None:
+        run_dir = continue_run_dir
+        run_name = os.path.basename(run_dir)
+        models_to_resume = {
+            "wm": world_model,
+            "ema_wm": ema_wm,
+        }
+        (
+            resumed_models,
+            optim,
+            scaler,
+            start_epoch,
+            resume_score,
+            resume_best_loss,
+        ) = load_ckpt(
+            models_dict=models_to_resume,
+            optimizer=optim,
+            scaler=scaler,
+            checkpoint_dir=os.path.join(run_dir, "weights"),
+            prefer_best=resume_prefer_best,
+            map_location=device,
+        )
+        world_model = resumed_models["wm"]
+        ema_wm = resumed_models["ema_wm"]
+        logger.INFO(
+            f"Resumed {beaut_name} from {run_dir} at epoch {start_epoch} "
+            f"using {'best' if resume_prefer_best else 'latest last'} checkpoints"
+        )
+
+    if rank == 0:
+        log_stats = create_self_supervised_logger(
+            log_dir = log_dir,
+            epochs = num_epochs,
+            run_name = run_name,
+            progress_type = progress_type,
+            save_csv = save_csv,
+            save_batch_csv = save_batch_csv,
+            save_epoch_csv = save_epoch_csv,
+            log_batch_tensorboard = log_batch_tensorboard,
+            resume_epoch = start_epoch
+        )
+        saver = MultiModuleEarlyStopping(
+            patience = patience,
+            freq = save_freq,
+            path_root = os.path.join(run_dir, "weights"),
+            weights_only = True,
+            min_delta = min_delta
+        )
+        if resume_best_loss is not None:
+            saver.best_loss = resume_best_loss
+        elif resume_score is not None:
+            saver.best_loss = resume_score
+        if not continue_train:
+            yaml_name = f"{args['app']}-{world_model.__class__.__qualname__}-{crop_size}px.yaml"
+            save_config_pretty(args, os.path.join(run_dir, yaml_name))
+    else:
+        log_stats = NoOpLogger()

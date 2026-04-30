@@ -1,11 +1,12 @@
 import inspect
 import traceback
 import time
+import json, re
 
 from datetime import datetime
 from typing import Literal, Union
 from rich.console import Console
-
+from omegaconf import OmegaConf, DictConfig, ListConfig
 class Logger(Console):
     _seen_once_calls = set()
     
@@ -192,3 +193,48 @@ class Logger(Console):
             self.__print_freq(log_func, frequency)
         else:
             log_func()
+
+def log_parameters(logger, module_name: str, params: dict):
+    """
+    Prints a dynamically sized box.
+    Collapses leaf-level lists (primitives) but keeps outer lists vertical.
+    """
+    
+    def _sanitize(obj):
+        if isinstance(obj, (DictConfig, ListConfig)):
+            return OmegaConf.to_container(obj, resolve=True)
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_sanitize(v) for v in obj]
+        return obj
+
+    # 1. Convert everything to standard Python types
+    printable_params = _sanitize(params)
+
+    # 2. Get the initial indented JSON string
+    json_str = json.dumps(printable_params, indent=4, default=str)
+
+    # 3. Targeted Regex: 
+    # Match '[' then whitespace, then any characters EXCEPT other brackets/braces, then ']'
+    # This ensures only "leaf" lists are collapsed.
+    json_str = re.sub(r'\[\s+([^\[\]{}]*?)\s+\]', 
+                      lambda m: "[" + ", ".join([x.strip() for x in m.group(1).split(",") if x.strip()]) + "]", 
+                      json_str)
+
+    lines = json_str.split('\n')
+
+    # 4. Compute dynamic width
+    header_text = f" CONFIGURATION FOR: {module_name} "
+    content_width = max(max(len(line) for line in lines), len(header_text))
+    box_width = content_width + 2 
+
+    # 5. Print the box
+    logger.INFO(f"╔{'═' * box_width}╗")
+    logger.INFO(f"║{header_text.center(box_width)}║")
+    logger.INFO(f"╠{'═' * box_width}╣")
+    
+    for line in lines:
+        logger.INFO(f"║ {line.ljust(content_width)} ║")
+        
+    logger.INFO(f"╚{'═' * box_width}╝")
