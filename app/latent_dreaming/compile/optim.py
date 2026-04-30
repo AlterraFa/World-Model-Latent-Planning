@@ -5,8 +5,8 @@ logger = Logger(__name__)
 
 def compile_opt(model: torch.nn.Module, optim_config: dict, mixed_precision = False):
     
-    ema = optim_config.get("ema", [0.99925, 0.99925])
-    ipe = optim_config.get("ipe", 200)
+    ema    = optim_config.get("ema", [0.99925, 0.99925])
+    ipe    = optim_config.get("ipe", 200)
     warmup = optim_config.get("warmup", 10)
     anneal = optim_config.get('anneal', 30)
     num_epochs = optim_config.get('epochs', 50)
@@ -61,5 +61,5 @@ def compile_opt(model: torch.nn.Module, optim_config: dict, mixed_precision = Fa
     scaler = torch.amp.GradScaler() if mixed_precision else None
     
     log_parameters(logger, "Optimization", optim_config)
-    
+
     return optimizer, scaler, scheduler, wd_scheduler, ema_scheduler

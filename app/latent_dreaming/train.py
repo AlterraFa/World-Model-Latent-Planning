@@ -2,6 +2,7 @@ import os, sys
 import resource
 import time
 import gc
+from functools import partial
 from pathlib import Path
 from omegaconf import OmegaConf, DictConfig, ListConfig
 from ruamel.yaml import YAML
@@ -13,6 +14,7 @@ resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 FOLDER_DIR = os.path.dirname(os.path.dirname(__file__))
 
 import random
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -33,6 +35,8 @@ from utils.training_logger import (
     create_self_supervised_logger,
     NoOpLogger
 )
+from datasets.utils.coordinate_transform import ego2local
+from datasets.utils.metadata import NuplanFrame
 from utils.distributed import init_distributed
 from utils.logger import Logger
 from utils.early_stop import EarlyStopping, MultiModuleEarlyStopping
@@ -148,10 +152,17 @@ def loss_registry(name):
 def main(args: dict, yaml_path: str):
     OmegaConf.register_new_resolver("div", lambda x, y: int(x / y))
     OmegaConf.resolve(args) 
+
+    common_cfg   = args.get("common", {})
+    patch_size   = common_cfg.get('patch_size', 16)
+    tubelet_size = common_cfg.get('tubelet_size', 2)
+    crop_size    = common_cfg.get('crop_size', 224)
+    fpcs         = common_cfg.get('fpcs', 8)
     
     model_cfg = args.get('model', {})
     
     loader_cfg = args.get('loader', {})
+    duration = loader_cfg.get("dataset_config", {}).get("duration", 5.0)
     
     augment_cfg = args.get('data_aug', {})
     auto_augment        = augment_cfg.get('auto_augment', False)
@@ -163,20 +174,11 @@ def main(args: dict, yaml_path: str):
     crop_size           = augment_cfg.get('crop_size', 244)
     
     loss_cfg = args.get('loss', {})
+    context_length = loss_cfg.get("context_length", 1) #-- Seconds
     
-    optim_cfg = args.get('optimization', {})
-    anneal       = optim_cfg.get('anneal', 15)
-    num_epochs   = optim_cfg.get('epochs', 100)
-    final_lr     = optim_cfg.get('final_lr', 0.0)
-    final_wd     = optim_cfg.get("final_weight_decay", 0.0)
-    ipe          = optim_cfg.get('ipe', 100)
-    lr           = optim_cfg.get('lr', 1e-3)
-    start_lr     = optim_cfg.get('start_lr', 1e-3)
-    warmup       = optim_cfg.get('warmup', 10)
-    weight_decay = optim_cfg.get('weight_decay', 0.0)
-    betas        = optim_cfg.get('betas', (0.9, 0.999))
-    eps          = optim_cfg.get('eps', 1.0e-8)
-    ema          = optim_cfg.get('ema', [0.9, 1.0])
+    optim_cfg  = args.get('optimization', {})
+    num_epochs = optim_cfg.get('epochs', 100)
+    ipe        = optim_cfg.get("ipe", 200)
     
     meta_cfg = args.get("meta", {})
     dtype              = meta_cfg.get('dtype', 'float32')
@@ -331,8 +333,9 @@ def main(args: dict, yaml_path: str):
             save_csv = save_csv,
             save_batch_csv = save_batch_csv,
             save_epoch_csv = save_epoch_csv,
-            log_batch_tensorboard = log_batch_tensorboard,
-            resume_epoch = start_epoch
+            use_wandb = True,
+            wandb_config = args,
+            wandb_project = app_name
         )
         saver = MultiModuleEarlyStopping(
             patience = patience,
@@ -348,5 +351,74 @@ def main(args: dict, yaml_path: str):
         if not continue_train:
             yaml_name = f"{args['app']}-{world_model.__class__.__qualname__}-{crop_size}px.yaml"
             save_config_pretty(args, os.path.join(run_dir, yaml_name))
+            
+        if log_model_graph:
+            B = 1
+            inp = torch.randn((B, 3, 8, crop_size, crop_size), device = device)
+            inp_ctx = inp[:, :, :-1]
+            inp_target = inp[:, :, -1:]
+            inp_goal = torch.randn((B, 2), device = device)
+
+            z_target = world_model.encode_frames(inp_target)
+            t = torch.rand((B,), device=inp_ctx.device)
+            frame_rate = torch.full((B, ), 5)
+            log_stats.log_model_graph(world_model, (inp_ctx, z_target, inp_goal, t, frame_rate))
     else:
         log_stats = NoOpLogger()
+
+    if sync_gc:
+        gc.disable()
+        gc.collect()
+
+    loader = iter(dataloader)
+    
+    def train_step(frames, images):
+        _new_lr = lr_scheduler.step()
+        _new_wd = wd_scheduler.step()
+        
+        images = images.to(device, dtype = dtype)
+        split_fpcs = math.ceil(context_length / duration * fpcs)
+        context_image = images[:, :, :split_fpcs]
+        target_image  = images[:, :, split_fpcs:]
+        
+        ego2local(frames.ego_pose)
+        with torch.autocast(device.type, dtype = dtype, enabled = mixed_precision):
+            latent_ctx = world_model.encode_frames(context_image)
+        
+    if start_epoch > 0:
+        for _ in range(start_epoch * ipe):
+            lr_scheduler.step()
+            wd_scheduler.step()
+        logger.INFO(f"Advanced LR/WD schedulers by {start_epoch * ipe} steps")
+
+    with log_stats:
+        log_stats.start_training("Diffusion World Model conditioned on Goal")
+        sampler.set_epoch(start_epoch)
+        
+        for epoch in range(start_epoch, num_epochs):
+            log_stats.start_epoch(epoch, ipe, desc = "Training")
+            
+            for itr in log_stats.batch_iterator([i for i in range(ipe)]):
+
+                iter_retries = 0
+                iter_success = False
+                while not iter_success:
+                    try:
+                        sample = next(loader)
+                        iter_success = True
+                    except StopIteration:
+                        loader = iter(dataloader)
+                        sampler.set_epoch(epoch)
+                    except Exception as e:
+                        NUM_RETRIES = 5
+                        if iter_retries < NUM_RETRIES:
+                            logger.WARNING(f"Encountered an error while iterating loader: {e}")
+                            iter_retries += 1
+                            time.sleep(5)
+                        else:
+                            logger.ERROR("Exceeded maximum retries when iterating dataloade. Please check for error", exit_code = 5, full_traceback = e)
+                            
+                frames: NuplanFrame; images: torch.Tensor
+                frames, images = sample
+
+                gpu_timer(partial(train_step, frames, images))
