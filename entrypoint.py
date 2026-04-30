@@ -5,12 +5,11 @@ sys.path.insert(0, root)
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 import argparse
 import multiprocessing as mp
-import yaml
+from omegaconf import OmegaConf
 import importlib
 import torch
 import glob
 import re
-from pathlib import Path
 
 from utils.distributed import init_distributed
 
@@ -96,9 +95,8 @@ def process(rank, fname, world_size, devices, continue_path=None, mode="train"):
         logger.INFO(f"Continuing from run directory: {resolved_continue_dir}")
         logger.INFO(f"Loading run config from: {config_path}")
 
-    with open(config_path, "r") as f:
-        params = yaml.load(f, Loader = yaml.FullLoader)
-        logger.INFO(f"Rank {rank} Loaded parameters")
+    params = OmegaConf.load(fname)
+    logger.INFO(f"Rank {rank} Loaded parameters")
 
     if resolved_continue_dir is not None:
         meta_cfg = params.setdefault("meta", {})
