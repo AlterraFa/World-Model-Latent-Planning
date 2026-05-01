@@ -10,6 +10,7 @@ dependencies = [
     "decord>=0.6.0",
     "diffusers>=0.37.1",
     "einops>=0.8.2",
+    "kaggle>=2.1.0",
     "multiprocess>=0.70.19",
     "omegaconf>=2.3.0",
     "opencv-python>=4.13.0.92",
