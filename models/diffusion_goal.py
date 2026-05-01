@@ -15,7 +15,7 @@ class DiffusionGoal(DiffusionWM):
     def drop_goal(self, goal):
         mask = torch.rand(goal.shape[0], device = goal.device) < self.goal_drop
         mask = mask.to(goal.device)
-        goal[mask] = torch.full((goal.shape[1], ), torch.nan, device = goal.device)
+        goal[mask] = torch.full((goal.shape[1], ), torch.nan, device = goal.device, dtype = goal.dtype)
         return goal
 
     def forward(self, x: torch.Tensor, noise: torch.Tensor, goal: torch.Tensor, t: torch.Tensor, frame_rate: torch.Tensor):

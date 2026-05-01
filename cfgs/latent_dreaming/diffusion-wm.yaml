@@ -52,10 +52,29 @@ model:
         ctx_noise_aug_ratio: 0.1
         ctx_noise_aug_prob: 0.5
         drop_ctx_rate: 0.1
+        grad_checkpointing: true
 
-data_aug: {}
+data_aug: 
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+  - 0.75
+  - 1.35
+  random_resize_scale:
+  - 1.0
+  - 1.777
+  reprob: 0.0
+  normalize: 
+  - [0.485, 0.456, 0.406]
+  - [0.229, 0.224, 0.225]
+  crop_size: *crop_size
 
-loss: {}
+loss:
+  context_length: 2 #-- seconds
+  loss_exp: 2.0
+  gen_chunksz: 5 #-- Timestep
+  randomize_goal: true
 
 optimization:
   ema:
@@ -91,5 +110,16 @@ logging:
   save_csv: true
   save_batch_csv: true
   save_epoch_csv: true
+  log_batch_scalars: true
   log_model_graph: true
-  use_wandb: true
+  backends:
+    - target: utils.training_logger.TensorBoardBackend
+      params:
+        log_dir: null                 # filled in at runtime with run_dir
+
+    - target: utils.training_logger.WandbBackend
+      params:
+        project: null                 # filled in with app_name
+        run_name: null                # filled in with run_name
+        log_dir: null                 # filled in with run_dir
+        resume: null                  # "allow" when resuming, else None

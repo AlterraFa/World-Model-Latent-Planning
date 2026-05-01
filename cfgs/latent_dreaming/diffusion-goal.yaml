@@ -8,7 +8,7 @@ common: &common_settings
 
 loader:
   batch_size: 8
-  num_workers: 4
+  num_workers: 2
   persistent_workers: true
   pin_mem: true
   dataset_config:
@@ -26,7 +26,7 @@ model:
   params:
     compile: false
     timescale: 1.0
-    goal_drop: 0.0
+    goal_drop: 0.1
 
     encoder_config:
       <<: *common_settings
@@ -53,6 +53,7 @@ model:
         ctx_noise_aug_ratio: 0.1
         ctx_noise_aug_prob: 0.5
         drop_ctx_rate: 0.1
+        grad_checkpointing: true
         steering_config:
           target: networks.DiT.dit_steering.LinearGoalEmbedder
           params:
@@ -78,6 +79,9 @@ data_aug:
 
 loss:
   context_length: 2 #-- seconds
+  loss_exp: 2.0
+  gen_chunksz: 5 #-- Timestep
+  randomize_goal: true
 
 optimization:
   ema:
@@ -113,5 +117,25 @@ logging:
   save_csv: true
   save_batch_csv: true
   save_epoch_csv: true
-  log_batch_tensorboard: true
+  log_batch_scalars: true
   log_model_graph: true
+  backends:
+    - target: utils.training_logger.TensorBoardBackend
+      params:
+        log_dir: null                 # filled in at runtime with run_dir
+
+    - target: utils.training_logger.WandbBackend
+      params:
+        project: null                 # filled in with app_name
+        run_name: null                # filled in with run_name
+        log_dir: null                 # filled in with run_dir
+        resume: null                  # "allow" when resuming, else None
+        # entity: my_team            # uncomment to set W&B team
+        # mode: offline              # uncomment for air-gapped runs
+
+    # - target: utils.training_logger.MLflowBackend
+    #   params:
+    #     experiment_name: latent_dreaming
+    #     run_name: null
+    #     tracking_uri: http://localhost:5000
+    #     log_model_artifact: false

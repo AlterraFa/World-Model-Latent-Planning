@@ -33,7 +33,8 @@ from .compile import (
 from utils.training_logger import (
     get_next_run,
     create_self_supervised_logger,
-    NoOpLogger
+    build_backends,
+    NoOpLogger,
 )
 from datasets.utils.coordinate_transform import ego2local
 from datasets.utils.metadata import NuplanFrame
@@ -175,8 +176,9 @@ def main(args: dict, yaml_path: str):
     
     loss_cfg = args.get('loss', {})
     context_length = loss_cfg.get("context_length", 1) #-- Seconds
-    gen_chunksz = loss_cfg.get("gen_chunksz", 1)
-    loss_exp = loss_cfg.get("loss_exp", 2.0)
+    gen_chunksz    = loss_cfg.get("gen_chunksz", 1)
+    loss_exp       = loss_cfg.get("loss_exp", 2.0)
+    randomize_goal = loss_cfg.get('randomize_goal', False)
     
     optim_cfg  = args.get('optimization', {})
     num_epochs = optim_cfg.get('epochs', 100)
@@ -201,7 +203,7 @@ def main(args: dict, yaml_path: str):
     save_csv              = logging_cfg.get('save_csv', True)
     save_batch_csv        = logging_cfg.get('save_batch_csv', False)
     save_epoch_csv        = logging_cfg.get('save_epoch_csv', True)
-    log_batch_tensorboard = logging_cfg.get('log_batch_tensorboard', False)
+    log_batch_scalars         = logging_cfg.get('log_batch_scalars', False)
     log_model_graph       = logging_cfg.get('log_model_graph', False)
 
     torch.manual_seed(seed)
@@ -262,9 +264,7 @@ def main(args: dict, yaml_path: str):
     log_dir = os.path.join(save_root_dir, app_name)
     logger.INFO(f"[i][u]{beaut_name}[/][/] save root directory: {log_dir}")
 
-
-    continue_run_dir = None
-    continue_run_name = None
+    continue_run_dir = continue_run_name = None
     if continue_train:
         continue_run_dir = os.path.abspath(os.path.expanduser(continue_from_path))
         if os.path.basename(continue_run_dir) == "weights":
@@ -276,7 +276,7 @@ def main(args: dict, yaml_path: str):
             raise ValueError(
                 f"Expected continue_from_path to point to a run directory like '.../run1', got: {continue_run_dir}"
             )
-            
+
     if rank == 0:
         if continue_train:
             resolved_run_idx = int(continue_run_name.removeprefix("run"))
@@ -293,59 +293,58 @@ def main(args: dict, yaml_path: str):
     logger.INFO("On run", run_idx)
 
     start_epoch = 0
-    resume_score = None
-    resume_best_loss = None
+    resume_score = resume_best_loss = None
     run_name = f"run{run_idx}"
     run_dir = os.path.join(log_dir, run_name)
 
-    if continue_train and continue_run_dir is not None:
+    if continue_train:
         run_dir = continue_run_dir
         run_name = os.path.basename(run_dir)
-        models_to_resume = {
-            "wm": world_model,
-            "ema_wm": ema_wm,
-        }
-        (
-            resumed_models,
-            optim,
-            scaler,
-            start_epoch,
-            resume_score,
-            resume_best_loss,
-        ) = load_ckpt(
-            models_dict=models_to_resume,
+        resumed_models, optim, scaler, start_epoch, resume_score, resume_best_loss = load_ckpt(
+            models_dict={"wm": world_model, "ema_wm": ema_wm},
             optimizer=optim,
             scaler=scaler,
             checkpoint_dir=os.path.join(run_dir, "weights"),
             prefer_best=resume_prefer_best,
             map_location=device,
         )
-        world_model = resumed_models["wm"]
-        ema_wm = resumed_models["ema_wm"]
+        world_model, ema_wm = resumed_models["wm"], resumed_models["ema_wm"]
         logger.INFO(
             f"Resumed {beaut_name} from {run_dir} at epoch {start_epoch} "
             f"using {'best' if resume_prefer_best else 'latest last'} checkpoints"
         )
 
     if rank == 0:
-        log_stats = create_self_supervised_logger(
-            log_dir = log_dir,
-            epochs = num_epochs,
-            run_name = run_name,
-            progress_type = progress_type,
-            save_csv = save_csv,
-            save_batch_csv = save_batch_csv,
-            save_epoch_csv = save_epoch_csv,
-            use_wandb = True,
-            wandb_config = args,
-            wandb_project = app_name
-        )
+        backends_cfg = logging_cfg.get("backends", [])
+        if not backends_cfg:
+            log_stats = NoOpLogger()
+        else:
+            _backends = build_backends(
+                backends_cfg,
+                runtime_params={
+                    "log_dir":  run_dir,
+                    "project":  app_name,
+                    "run_name": run_name,
+                    "resume":   "allow" if continue_train else None,
+                },
+            )
+            log_stats = create_self_supervised_logger(
+                log_dir=run_dir,
+                epochs=num_epochs,
+                backends=_backends,
+                progress_type=progress_type,
+                save_csv=save_csv,
+                save_batch_csv=save_batch_csv,
+                save_epoch_csv=save_epoch_csv,
+                log_batch_tensorboard=log_batch_scalars,
+                resume_epoch=start_epoch,
+            )
         saver = MultiModuleEarlyStopping(
-            patience = patience,
-            freq = save_freq,
-            path_root = os.path.join(run_dir, "weights"),
-            weights_only = True,
-            min_delta = min_delta
+            patience=patience,
+            freq=save_freq,
+            path_root=os.path.join(run_dir, "weights"),
+            weights_only=True,
+            min_delta=min_delta,
         )
         if resume_best_loss is not None:
             saver.best_loss = resume_best_loss
@@ -354,18 +353,14 @@ def main(args: dict, yaml_path: str):
         if not continue_train:
             yaml_name = f"{args['app']}-{world_model.__class__.__qualname__}-{crop_size}px.yaml"
             save_config_pretty(args, os.path.join(run_dir, yaml_name))
-            
+
         if log_model_graph:
             B = 1
-            inp = torch.randn((B, 3, 8, crop_size, crop_size), device = device)
-            inp_ctx = inp[:, :, :-1]
-            inp_target = inp[:, :, -1:]
-            inp_goal = torch.randn((B, 2), device = device)
-
-            z_target = world_model.encode_frames(inp_target)
-            t = torch.rand((B,), device=inp_ctx.device)
-            frame_rate = torch.full((B, ), 5)
-            log_stats.log_model_graph(world_model, (inp_ctx, z_target, inp_goal, t, frame_rate))
+            inp = torch.randn((B, 3, 8, crop_size, crop_size), device=device)
+            z_target = world_model.encode_frames(inp[:, :, -1:])
+            t = torch.rand((B,), device=device)
+            frame_rate = torch.full((B,), 5)
+            log_stats.log_model_graph(world_model, (inp[:, :, :-1], z_target, torch.randn((B, 2), device=device), t, frame_rate))
     else:
         log_stats = NoOpLogger()
 
@@ -399,47 +394,59 @@ def main(args: dict, yaml_path: str):
         def B_(t):
             return -(1.0 - sigma_min)
         
-        def transform_data(images, frames):
+        def preprocessing(images, frames):
             B = images.shape[0]
             images = images.to(device, dtype = dtype)
             ego_location = ego2local(frames.ego_pose).to(device, dtype = dtype)
             frame_rate = 1 / (frames.frame_timestamps.diff(n=1, dim=1).float().mean(-1) / 1e6).to(dtype)
-            t = torch.randn((B, ), device = device, dtype = dtype)
+            diffuse_time = torch.rand((B, ), device = device, dtype = dtype)
             
-            split_fpcs = math.ceil(context_length / duration * fpcs)
+            split_fpcs    = math.ceil(context_length / duration * fpcs)
             context_image = images[:, :, :split_fpcs]
             target_image  = images[:, :, split_fpcs:]
-            
-            return (context_image, target_image, ego_location, frame_rate, t)
+
+            goal_idx = torch.randint(gen_chunksz + split_fpcs + 1, fpcs, (B,), dtype=torch.long, device=device)
+            goal     = ego_location[torch.arange(B, device=device), goal_idx]  # (B, 2)
+
+            choosen_target              = target_image[:, :, :gen_chunksz]
+            latent_target         = world_model.encode_frames(choosen_target)
+            noisy_target, noise = add_noise(latent_target, diffuse_time)
+
+            return (context_image, latent_target, noisy_target, noise, goal, frame_rate, diffuse_time)
+        
+        @torch.no_grad()
+        def ema_update(decay):
+            params_k = list(ema_wm.parameters())
+            params_q_cpu = [p.to("cpu", non_blocking=True) for p in world_model.parameters()]
+            torch._foreach_mul_(params_k, decay)
+            torch._foreach_add_(params_k, params_q_cpu, alpha=1 - decay)
             
         
         
         with torch.autocast(device.type, dtype = dtype, enabled = mixed_precision):
             (
-                context_image, 
-                target_image, 
-                ego_loc, 
-                frame_rate, 
-                diffuse_time
-            ) = transform_data(images, frames)
+                context_image,
+                latent_target,
+                noisy_target,
+                noise,
+                goal,
+                frame_rate,
+                diffuse_time,
+            ) = preprocessing(images, frames)
 
-            # TODO: 
-            #-- add chunk generation for faster inference later
-            #-- randomize goal location based on ego_loc but cannot be before context_length + chunk_gen
-            choosen_target = target_image[:, :, :gen_chunksz]
-            latent_target = world_model.encode_frames(choosen_target)
-            noisy_target, noise = add_noise(latent_target, diffuse_time)
 
-            velocity = A_(t) * latent_target + B_(t) * noise
+            velocity = A_(diffuse_time) * latent_target + B_(diffuse_time) * noise
             pred_vel = world_model(
-                x = context_image, 
-                noise = noisy_target, 
-                goal = ego_loc[:, -1, :], 
-                t = diffuse_time, 
+                x = context_image,
+                noise = noisy_target,
+                goal = goal,
+                t = diffuse_time,
                 frame_rate = frame_rate
             )
             
-            loss = (((pred_vel - velocity) ** loss_exp) / loss_exp).mean()
+            loss: torch.Tensor = (((pred_vel - velocity) ** loss_exp) / loss_exp)
+            loss_pstep = loss.mean((0, 2, 3, 4))
+            loss = loss.mean()
 
         if mixed_precision:
             scaler.scale(loss).backward()
@@ -454,6 +461,16 @@ def main(args: dict, yaml_path: str):
             optim.step()
         optim.zero_grad()
 
+        m = next(ema_scheduler)
+        ema_update(m)
+        
+        return (
+            loss, 
+            loss_pstep,
+            _new_lr,
+            _new_wd
+        )
+        
         
     if start_epoch > 0:
         for _ in range(start_epoch * ipe):
@@ -491,4 +508,54 @@ def main(args: dict, yaml_path: str):
                 frames: NuplanFrame; images: torch.Tensor
                 frames, images = sample
 
-                gpu_timer(partial(train_step, frames, images))
+                (loss, loss_pstep, curr_lr, curr_wd), elapsed_time = gpu_timer(partial(train_step, frames, images))
+
+                loss_val = loss.item()
+                if np.isnan(loss_val) or np.isinf(loss_val):
+                    logger.ERROR(
+                        f"Model failed to converge. {'nan' if np.isnan(loss_val) else 'inf'} detected",
+                        exit_code=-213,
+                    )
+
+                batch_metrics = {
+                    "LR":   curr_lr,
+                    "WD":   curr_wd,
+                    "Loss": loss_val,
+                }
+                for step_i, step_loss in enumerate(loss_pstep.tolist()):
+                    batch_metrics[f"Loss|t{step_i}"] = step_loss
+
+                log_stats.log_batch(batch_metrics)
+
+            log_stats.log_epoch()
+
+            if sync_gc:
+                gc.collect()
+
+            if rank == 0:
+                models_to_save = {
+                    "wm":     world_model,
+                    "ema_wm": ema_wm,
+                }
+                saver(
+                    score=log_stats.get_metric("Loss", "train"),
+                    models_dict=models_to_save,
+                    optimizer=optim,
+                    scaler=scaler,
+                    epoch=epoch,
+                )
+
+                if saver.early_stop:
+                    logger.INFO("Early stopping triggered")
+
+            should_stop = False
+            if rank == 0:
+                should_stop = bool(saver.early_stop)
+
+            if dist.is_initialized() and world_size > 1:
+                stop_tensor = torch.tensor([int(should_stop)], device=device)
+                dist.broadcast(stop_tensor, src=0)
+                should_stop = bool(stop_tensor.item())
+
+            if should_stop:
+                break
