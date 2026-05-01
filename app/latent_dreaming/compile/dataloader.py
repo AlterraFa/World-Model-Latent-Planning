@@ -19,7 +19,7 @@ def compile_dataloader(train_cfg, transform, world_sz, rank):
         n_clips            = dataset_config.get("n_clips", 1),
         allow_clip_overlap = dataset_config.get("allow_overlap", False),
         random_jiggle_part = dataset_config.get("random_jiggle", True),
-        meta_keys          = "ego_frame",
+        meta_keys          = "ego_pose",
         shared_transform   = transform,
     )
     

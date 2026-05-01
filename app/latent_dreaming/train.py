@@ -288,6 +288,7 @@ def main(args: dict, yaml_path: str):
     if dist.is_initialized() and world_size > 1:
         dist.broadcast(run_idx_tensor, src=0)
     run_idx = int(run_idx_tensor.item())
+    logger.INFO("On run", run_idx)
 
     start_epoch = 0
     resume_score = None
@@ -372,18 +373,24 @@ def main(args: dict, yaml_path: str):
 
     loader = iter(dataloader)
     
-    def train_step(frames, images):
+    def train_step(frames: NuplanFrame, images: torch.Tensor):
         _new_lr = lr_scheduler.step()
         _new_wd = wd_scheduler.step()
         
         images = images.to(device, dtype = dtype)
+        ego_location = ego2local(frames.ego_pose).to(device, dtype = dtype)
+        frame_rate = 1 / (frames.frame_timestamps.diff(n=1, dim=1).float().mean(-1) / 1e6)
+        print(frame_rate)
+        
         split_fpcs = math.ceil(context_length / duration * fpcs)
         context_image = images[:, :, :split_fpcs]
         target_image  = images[:, :, split_fpcs:]
+
+        B = images.shape[0]
         
-        ego2local(frames.ego_pose)
         with torch.autocast(device.type, dtype = dtype, enabled = mixed_precision):
             latent_ctx = world_model.encode_frames(context_image)
+            t = torch.randn((B, ), device = device)
         
     if start_epoch > 0:
         for _ in range(start_epoch * ipe):
