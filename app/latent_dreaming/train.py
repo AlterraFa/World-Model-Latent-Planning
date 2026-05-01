@@ -175,6 +175,8 @@ def main(args: dict, yaml_path: str):
     
     loss_cfg = args.get('loss', {})
     context_length = loss_cfg.get("context_length", 1) #-- Seconds
+    gen_chunksz = loss_cfg.get("gen_chunksz", 1)
+    loss_exp = loss_cfg.get("loss_exp", 2.0)
     
     optim_cfg  = args.get('optimization', {})
     num_epochs = optim_cfg.get('epochs', 100)
@@ -376,21 +378,82 @@ def main(args: dict, yaml_path: str):
     def train_step(frames: NuplanFrame, images: torch.Tensor):
         _new_lr = lr_scheduler.step()
         _new_wd = wd_scheduler.step()
-        
-        images = images.to(device, dtype = dtype)
-        ego_location = ego2local(frames.ego_pose).to(device, dtype = dtype)
-        frame_rate = 1 / (frames.frame_timestamps.diff(n=1, dim=1).float().mean(-1) / 1e6)
-        print(frame_rate)
-        
-        split_fpcs = math.ceil(context_length / duration * fpcs)
-        context_image = images[:, :, :split_fpcs]
-        target_image  = images[:, :, split_fpcs:]
 
-        B = images.shape[0]
+
+        def add_noise(x, t, noise=None):
+            noise = torch.randn_like(x) if noise is None else noise
+            s = [x.shape[0]] + [1] * (x.dim() - 1)
+            x_t = alpha(t).view(*s) * x + sigma(t).view(*s) * noise
+            return x_t, noise
+
+        sigma_min = 1e-6
+        def alpha(t):
+            return 1.0 - t
+
+        def sigma(t):
+            return sigma_min + t * (1.0 - sigma_min)
+
+        def A_(t):
+            return 1.0
+
+        def B_(t):
+            return -(1.0 - sigma_min)
+        
+        def transform_data(images, frames):
+            B = images.shape[0]
+            images = images.to(device, dtype = dtype)
+            ego_location = ego2local(frames.ego_pose).to(device, dtype = dtype)
+            frame_rate = 1 / (frames.frame_timestamps.diff(n=1, dim=1).float().mean(-1) / 1e6).to(dtype)
+            t = torch.randn((B, ), device = device, dtype = dtype)
+            
+            split_fpcs = math.ceil(context_length / duration * fpcs)
+            context_image = images[:, :, :split_fpcs]
+            target_image  = images[:, :, split_fpcs:]
+            
+            return (context_image, target_image, ego_location, frame_rate, t)
+            
+        
         
         with torch.autocast(device.type, dtype = dtype, enabled = mixed_precision):
-            latent_ctx = world_model.encode_frames(context_image)
-            t = torch.randn((B, ), device = device)
+            (
+                context_image, 
+                target_image, 
+                ego_loc, 
+                frame_rate, 
+                diffuse_time
+            ) = transform_data(images, frames)
+
+            # TODO: 
+            #-- add chunk generation for faster inference later
+            #-- randomize goal location based on ego_loc but cannot be before context_length + chunk_gen
+            choosen_target = target_image[:, :, :gen_chunksz]
+            latent_target = world_model.encode_frames(choosen_target)
+            noisy_target, noise = add_noise(latent_target, diffuse_time)
+
+            velocity = A_(t) * latent_target + B_(t) * noise
+            pred_vel = world_model(
+                x = context_image, 
+                noise = noisy_target, 
+                goal = ego_loc[:, -1, :], 
+                t = diffuse_time, 
+                frame_rate = frame_rate
+            )
+            
+            loss = (((pred_vel - velocity) ** loss_exp) / loss_exp).mean()
+
+        if mixed_precision:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optim)
+        else:
+            loss.backward()
+            
+        if mixed_precision:
+            scaler.step(optim)
+            scaler.update()
+        else:
+            optim.step()
+        optim.zero_grad()
+
         
     if start_epoch > 0:
         for _ in range(start_epoch * ipe):
