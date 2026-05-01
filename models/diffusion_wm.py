@@ -127,24 +127,6 @@ class DiffusionWM(nn.Module):
         return target_t.squeeze(1)
     
         
-def add_noise(x, t, noise=None):
-    noise = torch.randn_like(x) if noise is None else noise
-    s = [x.shape[0]] + [1] * (x.dim() - 1)
-    x_t = alpha(t).view(*s) * x + sigma(t).view(*s) * noise
-    return x_t, noise
-
-sigma_min = 1e-6
-def alpha(t):
-    return 1.0 - t
-
-def sigma(t):
-    return sigma_min + t * (1.0 - sigma_min)
-
-def A_(t):
-    return 1.0
-
-def B_(t):
-    return -(1.0 - sigma_min)
 
 if __name__ == "__main__":
     device = torch.device('cuda')

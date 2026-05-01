@@ -5,7 +5,7 @@ import math
 
 from omegaconf import ListConfig
 from tqdm.auto import tqdm
-from .diffusion_wm import DiffusionWM, add_noise, A_, B_, alpha, sigma
+from .diffusion_wm import DiffusionWM
 
 class DiffusionGoal(DiffusionWM):
     def __init__(self, *, diffuser_config, encoder_config, compile = False, timescale=1, goal_drop=0.0):
@@ -80,9 +80,9 @@ if __name__ == "__main__":
     
     cfg = OmegaConf.load("./cfgs/latent_dreaming/diffusion-goal.yaml")
     OmegaConf.register_new_resolver("div", lambda x, y: int(x / y))
-    model_cfg = cfg['model']
+    model_cfg = cfg['model']['params']
     
-    model = DiffusionGoal(diffuser_config = model_cfg['diffuser'], encoder_config = model_cfg['encoder'], timescale = model_cfg['timescale'], goal_drop = model_cfg['goal_drop']).to(device)
+    model = DiffusionGoal(diffuser_config = model_cfg['diffuser_config'], encoder_config = model_cfg['encoder_config'], timescale = model_cfg['timescale'], goal_drop = model_cfg['goal_drop']).to(device)
     
     common_cfg = cfg['common']
     B = 1

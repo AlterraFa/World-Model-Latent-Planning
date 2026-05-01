@@ -543,6 +543,7 @@ class DiT(nn.Module):
         frequency_range=(2, 15),
         norm_layer=nn.LayerNorm,
         mlp_block='mlp',
+        grad_checkpointing=False,
         **kwargs
     ):
         super().__init__()
@@ -553,6 +554,7 @@ class DiT(nn.Module):
         self.ctx_noise_aug_ratio = ctx_noise_aug_ratio
         self.ctx_noise_aug_prob = ctx_noise_aug_prob
         self.drop_ctx_rate = drop_ctx_rate
+        self.grad_checkpointing = grad_checkpointing
 
         self.proj = nn.Linear(embed_dim, diffuse_dim, bias = True)
         self.t_embedder = TimestepEmbedder(diffuse_dim)
@@ -673,7 +675,10 @@ class DiT(nn.Module):
             x = rearrange(x,  'b f hw c -> b (f hw) c')
             features = []
             for block in self.blocks:
-                x = block(x, c)
+                if self.grad_checkpointing and self.training:
+                    x = checkpoint.checkpoint(block, x, c, use_reentrant=False)
+                else:
+                    x = block(x, c)
                 features.append(x) if return_features else None
             x = rearrange(x,  'b (f hw) c -> b f hw c', f=(num_frames_ctx+num_frames_pred))[:,-num_frames_pred:]
             out = self.final_layer(x, c)
@@ -685,11 +690,11 @@ class DiT(nn.Module):
 
 
 class CDiT(DiT):
-    def __init__(self, input_size=16, patch_size=2, in_channels=32, diffuse_dim=1152, depth=28, num_heads=16, mlp_ratio=4.0, max_num_frames=6, dropout=0.1, ctx_noise_aug_ratio=0.1,ctx_noise_aug_prob=0.5, norm_layer=nn.LayerNorm, mlp_block='mlp', **kwargs):
+    def __init__(self, input_size=16, patch_size=2, in_channels=32, diffuse_dim=1152, depth=28, num_heads=16, mlp_ratio=4.0, max_num_frames=6, dropout=0.1, ctx_noise_aug_ratio=0.1,ctx_noise_aug_prob=0.5, norm_layer=nn.LayerNorm, mlp_block='mlp', grad_checkpointing=False, **kwargs):
         if isinstance(norm_layer, str):
             norm_layer = get_norm_layer(norm_layer)
         super().__init__(input_size=input_size, patch_size=patch_size, in_channels=in_channels, diffuse_dim=diffuse_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio, max_num_frames=max_num_frames, dropout=dropout, 
-                         ctx_noise_aug_ratio=ctx_noise_aug_ratio, ctx_noise_aug_prob=ctx_noise_aug_prob, norm_layer=norm_layer, mlp_block=mlp_block, **kwargs)
+                         ctx_noise_aug_ratio=ctx_noise_aug_ratio, ctx_noise_aug_prob=ctx_noise_aug_prob, norm_layer=norm_layer, mlp_block=mlp_block, grad_checkpointing=grad_checkpointing, **kwargs)
         self.blocks = nn.ModuleList([
                 CDiTBlock(diffuse_dim, num_heads, mlp_ratio=mlp_ratio, norm_layer=norm_layer, mlp_block=mlp_block) for _ in range(depth)
             ])
@@ -714,7 +719,10 @@ class CDiT(DiT):
 
         features = []
         for block in self.blocks:
-            target = block(target, c, ctx)                      # (N, T, D)
+            if self.grad_checkpointing and self.training:
+                target = checkpoint.checkpoint(block, target, c, ctx, use_reentrant=False)
+            else:
+                target = block(target, c, ctx)                      # (N, T, D)
             features.append(target)
 
         target = rearrange(target,  'b (f hw) c -> b f hw c', f=(num_frames_pred))
@@ -730,14 +738,14 @@ class STDiT(DiT):
     def __init__(self, input_size=16, patch_size=2, embed_dim=768, diffuse_dim=1152, depth=28, num_heads=16, mlp_ratio=4.0, max_num_frames=6, 
                  dropout=0.1, ctx_noise_aug_ratio=0.1, ctx_noise_aug_prob=0.5, drop_ctx_rate=0.2, frequency_range=(2, 15), 
                  causal_time_attn=False, modulate_time_attn=False, norm_layer=nn.LayerNorm, mlp_block='mlp',
-                 **kwargs):
+                 grad_checkpointing=False, **kwargs):
         
         if isinstance(norm_layer, str):
             norm_layer = get_norm_layer(norm_layer)
             
         super().__init__(input_size=input_size, patch_size=patch_size, embed_dim=embed_dim, diffuse_dim=diffuse_dim, depth=depth, num_heads=num_heads, mlp_ratio=mlp_ratio, 
                          max_num_frames=max_num_frames, dropout=dropout, ctx_noise_aug_ratio=ctx_noise_aug_ratio, ctx_noise_aug_prob=ctx_noise_aug_prob, drop_ctx_rate=drop_ctx_rate, 
-                         norm_layer=norm_layer, mlp_block=mlp_block, **kwargs)
+                         norm_layer=norm_layer, mlp_block=mlp_block, grad_checkpointing=grad_checkpointing, **kwargs)
         self.blocks = nn.ModuleList([
                 STDiTBlock(diffuse_dim, num_heads, mlp_ratio=mlp_ratio, dropout_rate=dropout, 
                            causal_time_attn=causal_time_attn, modulate_time_attn=modulate_time_attn, 
@@ -758,7 +766,10 @@ class STDiT(DiT):
 
         features = []
         for block in self.blocks:
-            x = block(x, c)
+            if self.grad_checkpointing and self.training:
+                x = checkpoint.checkpoint(block, x, c, use_reentrant=False)
+            else:
+                x = block(x, c)
             features.append(x) if return_features else None
 
 

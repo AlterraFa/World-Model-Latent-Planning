@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.utils.checkpoint as checkpoint
 from torch import nn
 from .dit import STDiT
 from utils.autoload_modules import instantiate_from_config
@@ -99,8 +100,8 @@ class LinearGoalEmbedder(torch.nn.Module):
 
 
 class STDiTGoalConditioned(STDiT):    
-    def __init__(self, *, steering_config, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, *, steering_config, grad_checkpointing=False, **kwargs):
+        super().__init__(grad_checkpointing=grad_checkpointing, **kwargs)
         self.goal_embedder = instantiate_from_config(steering_config)
     
     def get_condition_embeddings(self, t, goal):
@@ -120,7 +121,10 @@ class STDiTGoalConditioned(STDiT):
         x = self.preprocess_inputs(target, context, t, frame_rate)
 
         for block in self.blocks:
-            x = block(x, c)
+            if self.grad_checkpointing and self.training:
+                x = checkpoint.checkpoint(block, x, c, use_reentrant=False)
+            else:
+                x = block(x, c)
         out = self.final_layer(x[:,-num_frames_pred:], c)
 
         out = self.postprocess_outputs(out)
