@@ -24,3 +24,6 @@ nuplan_dataset
 *.png
 *.jpeg
 *.bmp
+
+# Kaggle upload folder
+upload/

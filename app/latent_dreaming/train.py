@@ -151,7 +151,7 @@ def loss_registry(name):
     return decorator
 
 def main(args: dict, yaml_path: str):
-    OmegaConf.register_new_resolver("div", lambda x, y: int(x / y))
+    OmegaConf.register_new_resolver("div", lambda x, y: int(x / y), replace = True)
     OmegaConf.resolve(args) 
 
     common_cfg   = args.get("common", {})
@@ -314,6 +314,10 @@ def main(args: dict, yaml_path: str):
             f"using {'best' if resume_prefer_best else 'latest last'} checkpoints"
         )
 
+    if world_size > 1:
+        world_model = DDP(world_model, device_ids=[rank])
+    raw_wm = world_model.module if isinstance(world_model, DDP) else world_model
+
     if rank == 0:
         backends_cfg = logging_cfg.get("backends", [])
         if not backends_cfg:
@@ -351,16 +355,16 @@ def main(args: dict, yaml_path: str):
         elif resume_score is not None:
             saver.best_loss = resume_score
         if not continue_train:
-            yaml_name = f"{args['app']}-{world_model.__class__.__qualname__}-{crop_size}px.yaml"
+            yaml_name = f"{args['app']}-{raw_wm.__class__.__qualname__}-{crop_size}px.yaml"
             save_config_pretty(args, os.path.join(run_dir, yaml_name))
 
         if log_model_graph:
             B = 1
             inp = torch.randn((B, 3, 8, crop_size, crop_size), device=device)
-            z_target = world_model.encode_frames(inp[:, :, -1:])
+            z_target = raw_wm.encode_frames(inp[:, :, -1:])
             t = torch.rand((B,), device=device)
             frame_rate = torch.full((B,), 5)
-            log_stats.log_model_graph(world_model, (inp[:, :, :-1], z_target, torch.randn((B, 2), device=device), t, frame_rate))
+            log_stats.log_model_graph(raw_wm, (inp[:, :, :-1], z_target, torch.randn((B, 2), device=device), t, frame_rate))
     else:
         log_stats = NoOpLogger()
 
@@ -463,6 +467,10 @@ def main(args: dict, yaml_path: str):
 
         m = next(ema_scheduler)
         ema_update(m)
+
+        if dist.is_initialized() and world_size > 1:
+            all_reduce(loss)
+            all_reduce(loss_pstep)
         
         return (
             loss, 

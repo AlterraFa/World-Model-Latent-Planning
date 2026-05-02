@@ -100,18 +100,23 @@ class NuplanDataset(Dataset):
         self._log_dirs: dict = {}
         image_root_abs = os.path.abspath(image_root)
         if os.path.isdir(image_root_abs):
+            print(f"[Dataset] Scanning log dirs under {image_root_abs} ...")
             for entry in os.scandir(image_root_abs):
                 if entry.is_dir():
                     for sub in os.scandir(entry.path):
                         if sub.is_dir() and sub.name not in self._log_dirs:
                             self._log_dirs[sub.name] = entry.path
+            print(f"[Dataset] Found {len(self._log_dirs)} log dirs.")
 
         _cache_path = ".cache/dataset_cache.pkl"
         _db_set = set(database_paths)
         _cached_db_set: set = set()
         if os.path.exists(_cache_path):
+            _cache_size_mb = os.path.getsize(_cache_path) / 1024 / 1024
+            print(f"[Dataset] Loading cache ({_cache_size_mb:.1f} MB) ...")
             with open(_cache_path, "rb") as _f:
                 _cached_db_set, self.samples, self._log_time_cache = pickle.load(_f)
+            print(f"[Dataset] Cache loaded ({len(self.samples)} samples).")
         if _cached_db_set != _db_set:
             self.samples = []
             self._log_time_cache = {}
@@ -128,9 +133,12 @@ class NuplanDataset(Dataset):
                         con, bytearray.fromhex(log_token_hex)
                     )
                 con.close()
-            os.makedirs(os.path.dirname(_cache_path), exist_ok=True)
-            with open(_cache_path, "wb") as _f:
-                pickle.dump((_db_set, self.samples, self._log_time_cache), _f)
+            try:
+                os.makedirs(os.path.dirname(_cache_path), exist_ok=True)
+                with open(_cache_path, "wb") as _f:
+                    pickle.dump((_db_set, self.samples, self._log_time_cache), _f)
+            except Exception as e:
+                print(f"Error caching: {e}")
     @property
     def _local(self):
         if self._local_storage is None:

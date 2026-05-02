@@ -1,7 +1,7 @@
 import torch
 from utils.schedulers import CosineWSDSchedule, CosineWDSchedule, CosineSchedule
 from utils.logger import Logger, log_parameters
-logger = Logger(__name__)
+logger = Logger("compile_optimizer")
 
 def compile_opt(model: torch.nn.Module, optim_config: dict, mixed_precision = False):
     

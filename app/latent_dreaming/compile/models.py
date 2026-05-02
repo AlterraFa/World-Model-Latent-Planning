@@ -6,7 +6,7 @@ import json
 from omegaconf import OmegaConf, DictConfig 
 from utils.logger import Logger, log_parameters
 from utils.autoload_modules import instantiate_from_config
-logger = Logger(__name__)
+logger = Logger('compile_model')
 
 
 def compile_model(cfg: dict = None, device = torch.device('cpu')) -> tuple[nn.Module, nn.Module]:

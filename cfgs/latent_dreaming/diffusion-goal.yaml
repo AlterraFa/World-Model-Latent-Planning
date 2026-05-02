@@ -20,6 +20,7 @@ loader:
     random_jiggle: true
     channel: "F0"
     datasets_root: "./nuplan_dataset/"
+    db_scan_depth: 3  # max depth to search for .db files from datasets_root
 
 model: 
   target: models.diffusion_goal.DiffusionGoal

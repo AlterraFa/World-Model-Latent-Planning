@@ -1,17 +1,33 @@
 import os
 import csv
 import sys
+from abc import ABC
 from typing import Dict, Optional, List, Literal, Union, Tuple, Any
 from collections import defaultdict
 
 import torch
-from torch.utils.tensorboard import SummaryWriter
+
+from .logger import Logger
+logger = Logger(__name__)
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
 
 try:
     import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+try:
+    import mlflow
+    import mlflow.pytorch
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
 
 try:
     from progress_table import ProgressTable
@@ -25,8 +41,374 @@ if IS_KAGGLE_COMMIT:
     from tqdm import tqdm
 else:
     from tqdm.auto import tqdm
-    
+
 from omegaconf import OmegaConf, DictConfig, ListConfig
+
+
+# ------------------------------------------------------------------ #
+# Helper                                                               #
+# ------------------------------------------------------------------ #
+
+def _to_scalar(value) -> float:
+    if isinstance(value, torch.Tensor):
+        return value.item()
+    return float(value)
+
+
+# ================================================================== #
+# Logging Backends                                                     #
+# ================================================================== #
+
+class LoggerBackend(ABC):
+    """
+    Abstract base for a logging backend.
+
+    All methods are no-ops by default so concrete backends only override
+    what they support.  TrainingLogger dispatches every call to each
+    registered backend in order.
+    """
+
+    def log_epoch_scalars(self, metrics: Dict[str, float], epoch: int) -> None:
+        """Log epoch-level scalars.  Keys use ``Train/``, ``Val/`` etc. prefixes."""
+        for tag, value in metrics.items():
+            self.log_scalar(tag, value, epoch)
+
+    def log_iter_scalars(self, metrics: Dict[str, float], global_step: int) -> None:
+        """Log per-iteration scalars.  Keys use ``Iter_Train/`` etc. prefixes."""
+        for tag, value in metrics.items():
+            self.log_scalar(tag, value, global_step)
+
+    def log_scalar(self, tag: str, value: float, step: int) -> None:
+        pass
+
+    def log_histogram(self, tag: str, values, step: int) -> None:
+        pass
+
+    def log_media(self, tag: str, media, media_type: str, step: int,
+                  caption: Optional[str] = None) -> None:
+        pass
+
+    def log_table(self, key: str, columns: List[str], rows: List[List[Any]],
+                  step: int) -> None:
+        pass
+
+    def log_plot(self, key: str, plot: Any, step: int) -> None:
+        pass
+
+    def alert(self, title: str, text: str, level: str = "WARN") -> None:
+        pass
+
+    def watch_model(self, model, log: str = "gradients", log_freq: int = 100) -> None:
+        pass
+
+    def log_artifact(self, path: str, name: str, artifact_type: str = "model",
+                     metadata: Optional[Dict] = None) -> None:
+        pass
+
+    def save_checkpoint_artifact(self, path: str, name: str,
+                                  metadata: Optional[Dict] = None) -> None:
+        """Upload checkpoint according to the backend's own config.  No-op by default."""
+        pass
+
+    def update_summary(self, metrics: Dict[str, float]) -> None:
+        """Update run-level summary (e.g. best metrics).  No-op by default."""
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+# ------------------------------------------------------------------ #
+# TensorBoard backend                                                  #
+# ------------------------------------------------------------------ #
+
+class TensorBoardBackend(LoggerBackend):
+    """Writes scalars, histograms, and images to a TensorBoard ``SummaryWriter``."""
+
+    def __init__(self, log_dir: str):
+        if not TENSORBOARD_AVAILABLE:
+            raise ImportError("tensorboard is not installed.  pip install tensorboard")
+        self._writer = SummaryWriter(log_dir=log_dir)
+
+    def log_epoch_scalars(self, metrics: Dict[str, float], epoch: int) -> None:
+        for tag, value in metrics.items():
+            self._writer.add_scalar(tag, value, epoch)
+        self._writer.flush()
+
+    def log_iter_scalars(self, metrics: Dict[str, float], global_step: int) -> None:
+        for tag, value in metrics.items():
+            self._writer.add_scalar(tag, value, global_step)
+
+    def log_scalar(self, tag: str, value: float, step: int) -> None:
+        self._writer.add_scalar(tag, value, step)
+
+    def log_histogram(self, tag: str, values, step: int) -> None:
+        self._writer.add_histogram(tag, values, step)
+
+    def log_media(self, tag: str, media, media_type: str, step: int,
+                  caption: Optional[str] = None) -> None:
+        if media_type == "image" and isinstance(media, torch.Tensor):
+            self._writer.add_image(tag, media, step)
+
+    def close(self) -> None:
+        self._writer.flush()
+        self._writer.close()
+
+
+# ------------------------------------------------------------------ #
+# Weights & Biases backend                                             #
+# ------------------------------------------------------------------ #
+
+class WandbBackend(LoggerBackend):
+    """
+    Writes metrics, media, tables, and artifacts to Weights & Biases.
+
+    Args:
+        project: W&B project name.
+        run_name: Display name for the run.
+        entity: W&B team / user (uses default if omitted).
+        config: Hyperparameters dict logged to ``wandb.config``.
+        tags: List of string tags.
+        notes: Free-text notes for the run.
+        mode: ``"online"`` | ``"offline"`` | ``"disabled"``.
+        log_dir: Local directory for W&B files.
+        resume: ``"allow"`` | ``"must"`` | ``"never"`` | ``None``.
+        log_model_artifact: Upload checkpoints as W&B Artifacts automatically.
+        watch_log: ``"gradients"`` | ``"parameters"`` | ``"all"`` for ``wandb.watch``.
+        watch_log_freq: How often (in batches) ``wandb.watch`` logs values.
+    """
+
+    def __init__(
+        self,
+        project: str,
+        run_name: Optional[str] = None,
+        entity: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        notes: Optional[str] = None,
+        mode: str = "online",
+        log_dir: Optional[str] = None,
+        resume: Optional[str] = None,
+        log_model_artifact: bool = False,
+        watch_log: str = "gradients",
+        watch_log_freq: int = 100,
+    ):
+        if not WANDB_AVAILABLE:
+            raise ImportError("wandb is not installed.  pip install wandb")
+
+        # Auto-switch to offline when running in a Kaggle Batch kernel or any
+        # environment that has explicitly set WANDB_MODE=offline.
+        if mode == "online" and (IS_KAGGLE_COMMIT or os.environ.get("WANDB_MODE", "").lower() == "offline"):
+            logger.INFO("WandbBackend: offline environment detected — switching to mode='offline'")
+            mode = "offline"
+
+        # Flatten OmegaConf objects so wandb can serialise them
+        if isinstance(config, (DictConfig, ListConfig)):
+            config = OmegaConf.to_container(config, resolve=True)
+        elif isinstance(config, dict):
+            config = {
+                k: (OmegaConf.to_container(v, resolve=True)
+                    if isinstance(v, (DictConfig, ListConfig)) else v)
+                for k, v in config.items()
+            }
+
+        self._run = wandb.init(
+            project=project,
+            entity=entity,
+            name=run_name,
+            config=config or {},
+            tags=tags,
+            notes=notes,
+            mode=mode,
+            resume=resume,
+            dir=log_dir,
+        )
+        wandb.define_metric("epoch")
+        wandb.define_metric("Train/*", step_metric="epoch")
+        wandb.define_metric("Val/*",   step_metric="epoch")
+        wandb.define_metric("Misc/*",  step_metric="epoch")
+        wandb.define_metric("Iter_*",  step_metric="global_step")
+
+        self.log_model_artifact = log_model_artifact
+        self._watch_log = watch_log
+        self._watch_log_freq = watch_log_freq
+
+    def log_epoch_scalars(self, metrics: Dict[str, float], epoch: int) -> None:
+        wandb.log({"epoch": epoch, **metrics}, step=epoch)
+        # Keep run summary up to date for cross-run comparisons
+        summary = {k: v for k, v in metrics.items()
+                   if k.startswith(("Train/", "Val/"))}
+        if summary:
+            self.update_summary(summary)
+
+    def log_iter_scalars(self, metrics: Dict[str, float], global_step: int) -> None:
+        wandb.log({"global_step": global_step, **metrics}, step=global_step)
+
+    def log_scalar(self, tag: str, value: float, step: int) -> None:
+        wandb.log({tag: value}, step=step)
+
+    def log_histogram(self, tag: str, values, step: int) -> None:
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().numpy()
+        wandb.log({tag: wandb.Histogram(values)}, step=step)
+
+    def log_media(self, tag: str, media, media_type: str, step: int,
+                  caption: Optional[str] = None) -> None:
+        if isinstance(media, (wandb.Image, wandb.Audio, wandb.Video,
+                               wandb.Html, wandb.Molecule)):
+            wandb.log({tag: media}, step=step)
+            return
+        kw = {"caption": caption} if caption else {}
+        _wrap = {
+            "image":    lambda m: wandb.Image(m, **kw),
+            "audio":    lambda m: wandb.Audio(m, **kw),
+            "video":    lambda m: wandb.Video(m, **kw),
+            "html":     lambda m: wandb.Html(m),
+            "molecule": lambda m: wandb.Molecule(m, **kw),
+        }
+        wandb.log({tag: _wrap.get(media_type, lambda m: m)(media)}, step=step)
+
+    def log_table(self, key: str, columns: List[str], rows: List[List[Any]],
+                  step: int) -> None:
+        wandb.log({key: wandb.Table(columns=columns, data=rows)}, step=step)
+
+    def log_plot(self, key: str, plot: Any, step: int) -> None:
+        wandb.log({key: plot}, step=step)
+
+    def alert(self, title: str, text: str, level: str = "WARN") -> None:
+        wandb.alert(title=title, text=text, level=level)
+
+    def watch_model(self, model, log: str = None, log_freq: int = None) -> None:
+        wandb.watch(model,
+                    log=log or self._watch_log,
+                    log_freq=log_freq or self._watch_log_freq)
+
+    def log_artifact(self, path: str, name: str, artifact_type: str = "model",
+                     metadata: Optional[Dict] = None) -> None:
+        artifact = wandb.Artifact(name=name, type=artifact_type,
+                                  metadata=metadata or {})
+        artifact.add_file(path)
+        self._run.log_artifact(artifact)
+
+    def save_checkpoint_artifact(self, path: str, name: str,
+                                  metadata: Optional[Dict] = None) -> None:
+        if self.log_model_artifact:
+            self.log_artifact(path, name, artifact_type="model", metadata=metadata)
+
+    def update_summary(self, metrics: Dict[str, float]) -> None:
+        for key, value in metrics.items():
+            self._run.summary[key] = value
+
+    def close(self) -> None:
+        wandb.finish()
+
+
+# ------------------------------------------------------------------ #
+# MLflow backend                                                       #
+# ------------------------------------------------------------------ #
+
+class MLflowBackend(LoggerBackend):
+    """
+    Writes metrics, params, tags, and artifacts to MLflow.
+
+    Args:
+        experiment_name: MLflow experiment to log under.  Created if it
+            does not exist yet.
+        run_name: Display name for the MLflow run.
+        tracking_uri: MLflow tracking server URI.  Defaults to the
+            ``MLFLOW_TRACKING_URI`` environment variable or a local
+            ``./mlruns`` directory.
+        tags: Extra key-value tags attached to the run.
+        params: Hyperparameters logged once at startup via
+            ``mlflow.log_params``.
+        log_model_artifact: Upload checkpoints as MLflow artifacts.
+        run_id: Resume an existing run by ID instead of creating a new one.
+    """
+
+    def __init__(
+        self,
+        experiment_name: str,
+        run_name: Optional[str] = None,
+        tracking_uri: Optional[str] = None,
+        tags: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        log_model_artifact: bool = False,
+        run_id: Optional[str] = None,
+        offline: bool = False,
+    ):
+        if not MLFLOW_AVAILABLE:
+            raise ImportError("mlflow is not installed.  pip install mlflow")
+
+        # Offline mode: force a local file-based tracking URI so no server is needed.
+        if offline or IS_KAGGLE_COMMIT:
+            if tracking_uri is None:
+                tracking_uri = "./mlruns"
+            logger.INFO(f"MLflowBackend: offline mode — tracking URI set to '{tracking_uri}'")
+
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+
+        mlflow.set_experiment(experiment_name)
+
+        self._run = mlflow.start_run(run_id=run_id, run_name=run_name, tags=tags)
+        self.log_model_artifact = log_model_artifact
+
+        if params:
+            # mlflow.log_params has a 100-param-per-call limit; chunk if needed
+            items = list(params.items())
+            for i in range(0, len(items), 100):
+                mlflow.log_params(dict(items[i : i + 100]))
+
+    # -- properties --------------------------------------------------------
+
+    @property
+    def run_id(self) -> str:
+        return self._run.info.run_id
+
+    # -- logging -----------------------------------------------------------
+
+    def log_epoch_scalars(self, metrics: Dict[str, float], epoch: int) -> None:
+        mlflow.log_metrics(metrics, step=epoch)
+
+    def log_iter_scalars(self, metrics: Dict[str, float], global_step: int) -> None:
+        mlflow.log_metrics(metrics, step=global_step)
+
+    def log_scalar(self, tag: str, value: float, step: int) -> None:
+        mlflow.log_metric(tag, value, step=step)
+
+    def log_media(self, tag: str, media, media_type: str, step: int,
+                  caption: Optional[str] = None) -> None:
+        """Save tensors/paths as image artifacts.  Only images are supported."""
+        if media_type != "image":
+            return
+        try:
+            import tempfile
+            from torchvision.utils import save_image
+            if isinstance(media, torch.Tensor):
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    tmp_path = f.name
+                save_image(media.float(), tmp_path)
+                mlflow.log_artifact(tmp_path, artifact_path=f"media/{tag}")
+                os.remove(tmp_path)
+        except Exception as e:
+            logger.WARNING(f"MLflowBackend.log_media failed: {e}")
+
+    def log_artifact(self, path: str, name: str, artifact_type: str = "model",
+                     metadata: Optional[Dict] = None) -> None:
+        mlflow.log_artifact(path, artifact_path=artifact_type)
+
+    def save_checkpoint_artifact(self, path: str, name: str,
+                                  metadata: Optional[Dict] = None) -> None:
+        if self.log_model_artifact:
+            self.log_artifact(path, name, artifact_type="checkpoints")
+
+    def update_summary(self, metrics: Dict[str, float]) -> None:
+        # MLflow has no explicit run-summary; log with step=-1 as a convention
+        mlflow.log_metrics({f"summary/{k}": v for k, v in metrics.items()}, step=-1)
+
+    def close(self) -> None:
+        mlflow.end_run()
+
 
 class NoOpLogger:
     """
@@ -109,34 +491,27 @@ class NoOpLogger:
 
 class TrainingLogger:
     """
-    A training logger integrating TensorBoard and (optionally) Weights & Biases,
-    with tqdm / progress-table progress bars.
+    Training logger with pluggable backends (TensorBoard, W&B, …) and
+    tqdm / progress-table progress bars.
 
     Args:
-        log_dir: Directory to save TensorBoard logs and checkpoints.
+        log_dir: Directory to save CSV files and checkpoints.  If
+            ``run_name`` is also given the final path is
+            ``os.path.join(log_dir, run_name)``.
         epochs: Total number of training epochs.
-        run_name: Optional name appended to log_dir; also used as the W&B run name.
-        metrics_to_track: List of metric names to track (auto-detected if omitted).
-        progress_type: "tqdm" or "table".
-        use_validation: Set False for self-supervised training (no val metrics).
+        backends: List of :class:`LoggerBackend` instances to dispatch
+            every logging call to.  Defaults to
+            ``[TensorBoardBackend(log_dir)]`` when omitted.
+        run_name: Optional sub-directory name appended to ``log_dir``.
+        metrics_to_track: Metric names to track (auto-detected if omitted).
+        progress_type: ``"tqdm"`` or ``"table"``.
+        use_validation: Set ``False`` for self-supervised training.
         save_csv: Master switch for CSV export.
         save_batch_csv: Write per-batch CSV rows.
         save_epoch_csv: Write per-epoch CSV rows.
-        log_batch_tensorboard: Log every iteration to TensorBoard (not just epoch averages).
-        resume_epoch: Resume training from this epoch (reloads existing CSV rows).
-
-        # W&B-specific
-        use_wandb: Enable Weights & Biases logging.
-        wandb_project: W&B project name (required when use_wandb=True).
-        wandb_entity: W&B entity (team / user). Uses default if omitted.
-        wandb_config: Dict of hyperparameters to log to wandb.config.
-        wandb_tags: List of string tags for the W&B run.
-        wandb_notes: Free-text notes attached to the run.
-        wandb_mode: "online" | "offline" | "disabled". Useful for air-gapped envs.
-        wandb_watch_model: Auto-log gradients / parameters via wandb.watch().
-        wandb_watch_log: "gradients" | "parameters" | "all" (passed to wandb.watch).
-        wandb_watch_log_freq: How often (in batches) to log watched values.
-        wandb_log_model_artifact: Upload checkpoints as W&B Artifacts automatically.
+        log_batch_tensorboard: Forward every iteration to backends (not
+            just epoch averages).
+        resume_epoch: Resume training from this epoch (reloads CSV rows).
     """
 
     # ------------------------------------------------------------------ #
@@ -185,6 +560,7 @@ class TrainingLogger:
         self,
         log_dir: str,
         epochs: int,
+        backends: Optional[List[LoggerBackend]] = None,
         run_name: Optional[str] = None,
         metrics_to_track: Optional[List[str]] = None,
         progress_type: Literal["tqdm", "table"] = "tqdm",
@@ -192,20 +568,8 @@ class TrainingLogger:
         save_csv: bool = True,
         save_batch_csv: bool = False,
         save_epoch_csv: bool = True,
-        log_batch_tensorboard: bool = False,
+        log_batch_scalars: bool = False,
         resume_epoch: int = 0,
-        # W&B
-        use_wandb: bool = False,
-        wandb_project: Optional[str] = None,
-        wandb_entity: Optional[str] = None,
-        wandb_config: Optional[Dict[str, Any]] = None,
-        wandb_tags: Optional[List[str]] = None,
-        wandb_notes: Optional[str] = None,
-        wandb_mode: str = "online",
-        wandb_watch_model: bool = False,
-        wandb_watch_log: str = "gradients",
-        wandb_watch_log_freq: int = 100,
-        wandb_log_model_artifact: bool = False,
     ):
         self.epochs = epochs
         self.current_epoch = resume_epoch
@@ -215,21 +579,11 @@ class TrainingLogger:
         self.save_csv = save_csv
         self.save_batch_csv = save_batch_csv
         self.save_epoch_csv = save_epoch_csv
-        self.log_batch_tensorboard = log_batch_tensorboard
+        self.log_batch_tensorboard = log_batch_scalars
         self._global_step = 0
 
-        # W&B config
-        self.use_wandb = use_wandb and WANDB_AVAILABLE
-        self._wandb_watch_model = wandb_watch_model
-        self._wandb_watch_log = wandb_watch_log
-        self._wandb_watch_log_freq = wandb_watch_log_freq
-        self._wandb_log_model_artifact = wandb_log_model_artifact
-
-        if use_wandb and not WANDB_AVAILABLE:
-            print("Warning: wandb not installed, W&B logging disabled. pip install wandb")
-
         if progress_type == "table" and not PROGRESS_TABLE_AVAILABLE:
-            print("Warning: progress-table not installed, falling back to tqdm. pip install progress-table")
+            logger.WARNING("progress-table not installed, falling back to tqdm. pip install progress-table")
             self.progress_type = "tqdm"
 
         # Setup log directory
@@ -237,41 +591,10 @@ class TrainingLogger:
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(os.path.join(self.log_dir, "weights"), exist_ok=True)
 
-        # TensorBoard
-        self.writer = SummaryWriter(log_dir=self.log_dir)
-
-        # Weights & Biases
-        self._wandb_run = None
-        if self.use_wandb:
-            # 2. Convert wandb_config to a plain dict to avoid the Serialization error
-            processed_config = wandb_config
-            if isinstance(processed_config, (DictConfig, ListConfig)):
-                processed_config = OmegaConf.to_container(processed_config, resolve=True)
-            elif isinstance(processed_config, dict):
-                # If it's a dict that MIGHT contain OmegaConf sub-items, clean those too
-                processed_config = {
-                    k: (OmegaConf.to_container(v, resolve=True) if isinstance(v, (DictConfig, ListConfig)) else v)
-                    for k, v in processed_config.items()
-                }
-
-            resume_mode = "allow" if resume_epoch > 0 else None
-            self._wandb_run = wandb.init(
-                project=wandb_project,
-                entity=wandb_entity,
-                name=run_name,
-                config=processed_config or {},  # Use the cleaned config here
-                tags=wandb_tags,
-                notes=wandb_notes,
-                mode=wandb_mode,
-                resume=resume_mode,
-                dir=self.log_dir,
-            )
-            # Define custom x-axis so W&B uses our epoch counter everywhere
-            wandb.define_metric("epoch")
-            wandb.define_metric("Train/*", step_metric="epoch")
-            wandb.define_metric("Val/*",   step_metric="epoch")
-            wandb.define_metric("Misc/*",  step_metric="epoch")
-            wandb.define_metric("Iter_*",  step_metric="global_step")
+        # Backends — default to TensorBoard only
+        if backends is None:
+            backends = [TensorBoardBackend(self.log_dir)]
+        self._backends: List[LoggerBackend] = list(backends)
 
         # Progress bars
         self.epoch_pbar: Optional[tqdm] = None
@@ -324,7 +647,7 @@ class TrainingLogger:
         self._current_batch = 0
 
     # ------------------------------------------------------------------ #
-    # W&B model watching                                                   #
+    # Model watching                                                       #
     # ------------------------------------------------------------------ #
 
     def watch(
@@ -334,16 +657,15 @@ class TrainingLogger:
         log_freq: int = 100,
     ):
         """
-        Enable W&B gradient / parameter auto-logging for a model.
-        Must be called after wandb.init (i.e. after TrainingLogger.__init__).
+        Forward model watching to all backends (e.g. W&B gradient logging).
 
         Args:
             model: The model to watch.
-            log: "gradients" | "parameters" | "all"
+            log: ``"gradients"`` | ``"parameters"`` | ``"all"``
             log_freq: How often (in batches) to log.
         """
-        if self.use_wandb and self._wandb_run is not None:
-            wandb.watch(model, log=log, log_freq=log_freq)
+        for backend in self._backends:
+            backend.watch_model(model, log=log, log_freq=log_freq)
 
     # ------------------------------------------------------------------ #
     # Training / epoch / phase lifecycle                                   #
@@ -472,20 +794,12 @@ class TrainingLogger:
 
         if self.log_batch_tensorboard:
             tb_prefix = "Iter_Train" if phase == "train" else "Iter_Val"
+            iter_scalars: Dict[str, float] = {}
             for key, value in clean_metrics.items():
-                if key in phase_agnostic:
-                    self.writer.add_scalar(f"Iter_Misc/{key}", value, self._global_step)
-                else:
-                    self.writer.add_scalar(f"{tb_prefix}/{key}", value, self._global_step)
-
-        # W&B per-iteration logging
-        if self.use_wandb and self._wandb_run is not None and self.log_batch_tensorboard:
-            wb_prefix = "Iter_Train" if phase == "train" else "Iter_Val"
-            wb_log: Dict[str, Any] = {"global_step": self._global_step}
-            for key, value in clean_metrics.items():
-                bucket = "Iter_Misc" if key in phase_agnostic else wb_prefix
-                wb_log[f"{bucket}/{key}"] = value
-            wandb.log(wb_log, step=self._global_step)
+                bucket = "Iter_Misc" if key in phase_agnostic else tb_prefix
+                iter_scalars[f"{bucket}/{key}"] = value
+            for backend in self._backends:
+                backend.log_iter_scalars(iter_scalars, self._global_step)
 
         # Progress display
         if self.progress_type == "tqdm":
@@ -544,41 +858,21 @@ class TrainingLogger:
 
         misc_metrics = {k: sum(v) / len(v) for k, v in self._misc_metrics_accum.items() if v}
 
-        # --- TensorBoard ---
+        # --- Build prefixed scalars dict and dispatch to all backends ---
+        epoch_scalars: Dict[str, float] = {}
         for key, value in train_metrics.items():
-            self.writer.add_scalar(f"Train/{key}", _to_scalar(value), epoch)
+            epoch_scalars[f"Train/{key}"] = _to_scalar(value)
         if self.use_validation and val_metrics:
             for key, value in val_metrics.items():
-                self.writer.add_scalar(f"Val/{key}", _to_scalar(value), epoch)
-        if misc_metrics:
-            for key, value in misc_metrics.items():
-                self.writer.add_scalar(f"Misc/{key}", _to_scalar(value), epoch)
+                epoch_scalars[f"Val/{key}"] = _to_scalar(value)
+        for key, value in misc_metrics.items():
+            epoch_scalars[f"Misc/{key}"] = _to_scalar(value)
         if extra_metrics:
             for key, value in extra_metrics.items():
-                self.writer.add_scalar(f"Misc/{key}", _to_scalar(value), epoch)
-        self.writer.flush()
+                epoch_scalars[f"Misc/{key}"] = _to_scalar(value)
 
-        # --- W&B ---
-        if self.use_wandb and self._wandb_run is not None:
-            wb_log: Dict[str, Any] = {"epoch": epoch}
-            for key, value in train_metrics.items():
-                wb_log[f"Train/{key}"] = _to_scalar(value)
-            if self.use_validation and val_metrics:
-                for key, value in val_metrics.items():
-                    wb_log[f"Val/{key}"] = _to_scalar(value)
-            for key, value in misc_metrics.items():
-                wb_log[f"Misc/{key}"] = _to_scalar(value)
-            if extra_metrics:
-                for key, value in extra_metrics.items():
-                    wb_log[f"Misc/{key}"] = _to_scalar(value)
-            wandb.log(wb_log, step=epoch)
-
-            # Update run summary with latest metrics (useful for W&B table comparisons)
-            for key, value in train_metrics.items():
-                wandb.run.summary[f"Train/{key}"] = _to_scalar(value)
-            if self.use_validation and val_metrics:
-                for key, value in val_metrics.items():
-                    wandb.run.summary[f"Val/{key}"] = _to_scalar(value)
+        for backend in self._backends:
+            backend.log_epoch_scalars(epoch_scalars, epoch)
 
         # --- CSV ---
         if self.save_csv and self.save_epoch_csv:
@@ -621,7 +915,7 @@ class TrainingLogger:
         self._print_epoch_summary(epoch, train_metrics, val_metrics, extra_metrics)
 
     # ------------------------------------------------------------------ #
-    # Rich W&B logging                                                     #
+    # Rich logging                                                         #
     # ------------------------------------------------------------------ #
 
     def log_table(
@@ -632,9 +926,10 @@ class TrainingLogger:
         step: Optional[int] = None,
     ):
         """
-        Log a structured table to W&B (e.g. predictions vs ground truth).
+        Log a structured table to all backends that support it (e.g. W&B).
 
-        Example:
+        Example::
+
             logger.log_table(
                 "predictions",
                 columns=["image", "pred", "label", "confidence"],
@@ -642,15 +937,14 @@ class TrainingLogger:
             )
 
         Args:
-            key: W&B table key shown in the dashboard.
+            key: Table name shown in the dashboard.
             columns: Column headers.
             rows: List of rows (each row is a list matching columns).
             step: Optional step override (uses current epoch if omitted).
         """
-        if not (self.use_wandb and self._wandb_run is not None):
-            return
-        table = wandb.Table(columns=columns, data=rows)
-        wandb.log({key: table}, step=step or (self.current_epoch + 1))
+        step = step or (self.current_epoch + 1)
+        for backend in self._backends:
+            backend.log_table(key, columns, rows, step)
 
     def log_media(
         self,
@@ -661,40 +955,20 @@ class TrainingLogger:
         caption: Optional[str] = None,
     ):
         """
-        Log rich media to TensorBoard and/or W&B.
-
-        For W&B, wraps the value in the appropriate wandb media class.
-        For TensorBoard, only images are supported (others are W&B-only).
+        Log rich media to all backends.
 
         Args:
             tag: Metric key / panel name.
-            media: A torch.Tensor (image), file path (str), or pre-built wandb object.
-            media_type: One of "image", "audio", "video", "html", "molecule".
+            media: A ``torch.Tensor`` (image), file path (str), or a pre-built
+                backend media object.
+            media_type: One of ``"image"``, ``"audio"``, ``"video"``,
+                ``"html"``, ``"molecule"``.
             step: Optional step (defaults to current epoch).
-            caption: Optional caption (W&B only).
+            caption: Optional caption (backend-specific).
         """
         step = step or (self.current_epoch + 1)
-
-        # TensorBoard: images only
-        if media_type == "image" and isinstance(media, torch.Tensor):
-            self.writer.add_image(tag, media, step)
-
-        # W&B
-        if self.use_wandb and self._wandb_run is not None:
-            if not isinstance(media, (wandb.Image, wandb.Audio, wandb.Video,
-                                      wandb.Html, wandb.Molecule)):
-                kwargs = {"caption": caption} if caption else {}
-                if media_type == "image":
-                    media = wandb.Image(media, **kwargs)
-                elif media_type == "audio":
-                    media = wandb.Audio(media, **kwargs)
-                elif media_type == "video":
-                    media = wandb.Video(media, **kwargs)
-                elif media_type == "html":
-                    media = wandb.Html(media)
-                elif media_type == "molecule":
-                    media = wandb.Molecule(media, **kwargs)
-            wandb.log({tag: media}, step=step)
+        for backend in self._backends:
+            backend.log_media(tag, media, media_type, step, caption)
 
     def log_plot(
         self,
@@ -703,24 +977,23 @@ class TrainingLogger:
         step: Optional[int] = None,
     ):
         """
-        Log a pre-built wandb.plot.* chart.
+        Log a pre-built chart object to all backends that support it.
 
-        Example:
-            from sklearn.metrics import confusion_matrix
-            import wandb
+        Example (W&B)::
+
             cm = wandb.plot.confusion_matrix(
                 y_true=labels, preds=preds, class_names=["cat", "dog"]
             )
             logger.log_plot("confusion_matrix", cm)
 
         Args:
-            key: Chart name in the W&B dashboard.
-            plot: A wandb.plot object.
+            key: Chart name in the backend dashboard.
+            plot: A backend-specific plot object.
             step: Optional step override.
         """
-        if not (self.use_wandb and self._wandb_run is not None):
-            return
-        wandb.log({key: plot}, step=step or (self.current_epoch + 1))
+        step = step or (self.current_epoch + 1)
+        for backend in self._backends:
+            backend.log_plot(key, plot, step)
 
     def alert(
         self,
@@ -729,19 +1002,15 @@ class TrainingLogger:
         level: Literal["INFO", "WARN", "ERROR"] = "WARN",
     ):
         """
-        Send a W&B alert (email / Slack) when a notable event occurs.
-
-        Example:
-            if val_loss < best_loss:
-                logger.alert("New best model", f"Val loss dropped to {val_loss:.4f}")
+        Send an alert through all backends that support it (e.g. W&B email/Slack).
 
         Args:
             title: Short title for the alert.
             text: Alert body text.
-            level: "INFO", "WARN", or "ERROR".
+            level: ``"INFO"``, ``"WARN"``, or ``"ERROR"``.
         """
-        if self.use_wandb and self._wandb_run is not None:
-            wandb.alert(title=title, text=text, level=level)
+        for backend in self._backends:
+            backend.alert(title, text, level)
 
     # ------------------------------------------------------------------ #
     # Existing helpers                                                     #
@@ -750,68 +1019,51 @@ class TrainingLogger:
     def log_model_graph(
         self,
         model: torch.nn.Module,
-        input_sample: Union[torch.Tensor, Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]],
+        input_sample: Union[torch.Tensor, Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]] = None,
     ):
-        """Log model architecture graph to TensorBoard and W&B."""
-        # 1. TensorBoard Graph (Tracing)
-        if self.use_wandb and self._wandb_run is not None:
-            self.watch(model, log="all")
+        """Save model architecture to disk and notify all backends."""
+        arch_path = os.path.join(self.log_dir, "model_arch.txt")
+        try:
+            with open(arch_path, "w") as f:
+                f.write(str(model))
+        except Exception as e:
+            logger.WARNING(f"Could not save model arch text: {e}")
 
-            # 3. Log a textual summary as a W&B Table (Very readable)
+        # Log a layer-summary table for backends that support it (e.g. W&B)
+        try:
+            model_stats = [
+                [name, type(module).__name__,
+                 sum(p.numel() for p in module.parameters())]
+                for name, module in model.named_modules()
+                if len(name.split(".")) <= 2
+            ]
+            self.log_table(
+                "model_structure",
+                columns=["Layer Name", "Layer Type", "Parameters"],
+                rows=model_stats,
+            )
+        except Exception as e:
+            logger.WARNING(f"Could not log model structure table: {e}")
+
+        for backend in self._backends:
             try:
-                model_stats = []
-                for name, module in model.named_modules():
-                    # Only log top-level or main layers to keep table clean
-                    if len(name.split('.')) <= 2: 
-                        params = sum(p.numel() for p in module.parameters())
-                        model_stats.append([name, str(type(module).__name__), params])
-                
-                self.log_table(
-                    "model_structure", 
-                    columns=["Layer Name", "Layer Type", "Parameters"], 
-                    rows=model_stats
-                )
-                
-                # Also save the raw string representation
-                with open(os.path.join(self.log_dir, "model_summary.txt"), "w") as f:
-                    f.write(str(model))
-                    
+                backend.watch_model(model)
             except Exception as e:
-                print(f"W&B Table logging failed: {e}")
-
-        # 2. Weights & Biases Architecture Logging
-        if self.use_wandb and self._wandb_run is not None:
+                logger.WARNING(f"{type(backend).__name__}.watch_model failed: {e}")
             try:
-                # Use your existing watch method to track gradients/parameters
-                # This populates the 'Gradients' and 'Graph' tabs in W&B
-                self.watch(model, log=self._wandb_watch_log, log_freq=self._wandb_watch_log_freq)
-
-                # Log the text representation of the model as an Artifact
-                # This is useful for auditing the exact architecture layers later
-                arch_path = os.path.join(self.log_dir, "model_arch.txt")
-                with open(arch_path, "w") as f:
-                    f.write(str(model))
-                
-                model_artifact = wandb.Artifact(
-                    name=f"{self._wandb_run.name or 'model'}_architecture", 
-                    type="model_description"
-                )
-                model_artifact.add_file(arch_path)
-                self._wandb_run.log_artifact(model_artifact)
-
+                backend.log_artifact(arch_path, name="model_architecture",
+                                     artifact_type="model_description")
             except Exception as e:
-                msg = f"Warning: Could not log W&B model graph: {e}"
-                tqdm.write(msg) if self.progress_type == "tqdm" else print(msg)
+                logger.WARNING(f"{type(backend).__name__}.log_artifact failed: {e}")
 
     def log_histogram(self, tag: str, values: torch.Tensor, step: Optional[int] = None):
-        """Log a histogram of values (e.g. weights, gradients) to TensorBoard."""
+        """Log a histogram of values (e.g. weights, gradients) to all backends."""
         step = step or self.current_epoch + 1
-        self.writer.add_histogram(tag, values, step)
-        if self.use_wandb and self._wandb_run is not None:
-            wandb.log({tag: wandb.Histogram(values.detach().cpu().numpy())}, step=step)
+        for backend in self._backends:
+            backend.log_histogram(tag, values, step)
 
     def log_image(self, tag: str, image: torch.Tensor, step: Optional[int] = None):
-        """Log an image to TensorBoard (and W&B if enabled)."""
+        """Log an image to all backends."""
         self.log_media(tag, image, media_type="image", step=step)
 
     def get_epoch_metrics(self, phase: str = "val") -> Dict[str, float]:
@@ -838,7 +1090,7 @@ class TrainingLogger:
         log_as_artifact: Optional[bool] = None,
     ):
         """
-        Save a training checkpoint and (optionally) upload it as a W&B Artifact.
+        Save a training checkpoint and optionally upload it via all backends.
 
         Args:
             models: Dict of name → model.
@@ -846,8 +1098,9 @@ class TrainingLogger:
             scheduler: Optional LR scheduler.
             filename: Override default filename.
             extra_state: Additional state to include in the checkpoint dict.
-            log_as_artifact: Upload to W&B as a versioned Artifact.
-                             Defaults to wandb_log_model_artifact constructor arg.
+            log_as_artifact: ``True`` forces upload; ``False`` skips upload;
+                ``None`` lets each backend decide (via
+                :meth:`LoggerBackend.save_checkpoint_artifact`).
         """
         if filename is None:
             filename = f"checkpoint_epoch_{self.current_epoch + 1}.pt"
@@ -867,19 +1120,18 @@ class TrainingLogger:
         torch.save(checkpoint, save_path)
 
         msg = f"Checkpoint saved: {save_path}"
-        tqdm.write(msg) if self.progress_type == "tqdm" else print(msg)
+        tqdm.write(msg) if self.progress_type == "tqdm" else logger.INFO(msg)
 
-        # W&B artifact upload
-        should_upload = log_as_artifact if log_as_artifact is not None else self._wandb_log_model_artifact
-        if should_upload and self.use_wandb and self._wandb_run is not None:
-            artifact = wandb.Artifact(
-                name=f"checkpoint-epoch-{self.current_epoch + 1}",
-                type="model",
-                description=f"Checkpoint at epoch {self.current_epoch + 1}",
-                metadata={"epoch": self.current_epoch + 1},
-            )
-            artifact.add_file(save_path)
-            wandb.log_artifact(artifact)
+        ckpt_name = f"checkpoint-epoch-{self.current_epoch + 1}"
+        ckpt_meta = {"epoch": self.current_epoch + 1}
+        if log_as_artifact is True:
+            for backend in self._backends:
+                backend.log_artifact(save_path, ckpt_name,
+                                     artifact_type="model", metadata=ckpt_meta)
+        elif log_as_artifact is None:
+            for backend in self._backends:
+                backend.save_checkpoint_artifact(save_path, ckpt_name,
+                                                  metadata=ckpt_meta)
 
     # ------------------------------------------------------------------ #
     # Internal                                                             #
@@ -912,16 +1164,15 @@ class TrainingLogger:
         else:
             if self.progress_table is not None:
                 self.progress_table.close()
-        self.writer.close()
-        if self.use_wandb and self._wandb_run is not None:
-            wandb.finish()
+        for backend in self._backends:
+            backend.close()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
-            print(f"Exception during training: {exc_type.__name__}: {exc_val}")
+            logger.ERROR(f"Exception during training: {exc_type.__name__}: {exc_val}")
         self.close()
         return False
 
@@ -930,10 +1181,87 @@ class TrainingLogger:
 # Module-level helpers                                                 #
 # ------------------------------------------------------------------ #
 
-def _to_scalar(value) -> float:
-    if isinstance(value, torch.Tensor):
-        return value.item()
-    return float(value)
+
+def build_backends(
+    backends_cfg: List[Dict[str, Any]],
+    runtime_params: Optional[Dict[str, Any]] = None,
+    force_offline: Optional[bool] = None,
+) -> List[LoggerBackend]:
+    """
+    Instantiate a list of :class:`LoggerBackend` objects from config dicts.
+
+    Each entry in *backends_cfg* must follow the ``autoload_modules``
+    convention::
+
+        target: utils.training_logger.TensorBoardBackend
+        params:
+          log_dir: ./runs/run1
+
+    ``runtime_params`` are merged into every backend's ``params`` before
+    instantiation, but *only* for keys whose config value is ``null``.
+    Any other YAML value (string, int, bool, …) is kept as-is.
+    This lets callers inject dynamic values (``run_dir``, ``run_name``, …)
+    while still allowing per-backend overrides in YAML.
+
+    Example YAML block (inside ``logging:``):::
+
+        backends:
+          - target: utils.training_logger.TensorBoardBackend
+            params:
+              log_dir: null             # filled from runtime_params
+          - target: utils.training_logger.WandbBackend
+            params:
+              project: my_project       # kept as-is from YAML
+              run_name: null            # filled from runtime_params
+              log_dir: null             # filled from runtime_params
+          - target: utils.training_logger.MLflowBackend
+            params:
+              experiment_name: my_experiment
+              run_name: null            # filled from runtime_params
+
+    Args:
+        backends_cfg: List of ``{target, params}`` dicts (from OmegaConf or plain dict).
+        runtime_params: Key/value pairs injected into each backend's params when
+            the key is already present in the config (placeholder value is
+            overwritten regardless of what it was).
+    Returns:
+        List of instantiated :class:`LoggerBackend` objects.
+    """
+    from utils.autoload_modules import get_obj_from_str
+
+    runtime_params = runtime_params or {}
+    # If not explicitly set, auto-detect offline environments (Kaggle batch, etc.)
+    if force_offline is None:
+        force_offline = IS_KAGGLE_COMMIT or os.environ.get("WANDB_MODE", "").lower() == "offline"
+    backends: List[LoggerBackend] = []
+
+    for cfg in backends_cfg:
+        if isinstance(cfg, (DictConfig, ListConfig)):
+            cfg = OmegaConf.to_container(cfg, resolve=True)
+
+        target = cfg.get("target")
+        if not target:
+            raise KeyError(f"Backend config entry is missing 'target': {cfg}")
+
+        params: Dict[str, Any] = dict(cfg.get("params") or {})
+
+        # Inject runtime values only for keys whose YAML value is null
+        for key, value in runtime_params.items():
+            if key in params and params[key] is None:
+                params[key] = value
+
+        # Apply offline overrides per-backend type
+        if force_offline:
+            cls_name = target.rsplit(".", 1)[-1]
+            if cls_name == "WandbBackend" and params.get("mode", "online") == "online":
+                params["mode"] = "offline"
+            elif cls_name == "MLflowBackend":
+                params.setdefault("offline", True)
+
+        cls = get_obj_from_str(target)
+        backends.append(cls(**params))
+
+    return backends
 
 
 def get_next_run(exp_dir: str) -> int:
@@ -956,6 +1284,7 @@ def get_next_run(exp_dir: str) -> int:
 def create_supervised_logger(
     log_dir: str,
     epochs: int,
+    backends: Optional[List[LoggerBackend]] = None,
     run_name: Optional[str] = None,
     progress_type: Literal["tqdm", "table"] = "tqdm",
     save_csv: bool = True,
@@ -963,33 +1292,34 @@ def create_supervised_logger(
     save_epoch_csv: bool = True,
     log_batch_tensorboard: bool = False,
     resume_epoch: int = 0,
-    use_wandb: bool = False,
-    wandb_project: Optional[str] = None,
-    wandb_config: Optional[Dict[str, Any]] = None,
-    **wandb_kwargs,
 ) -> TrainingLogger:
-    """Create a TrainingLogger configured for supervised training (with validation)."""
+    """
+    Create a :class:`TrainingLogger` for supervised training (with validation).
+
+    When *backends* is omitted a single :class:`TensorBoardBackend` writing
+    to ``log_dir / run_name`` is created automatically.
+    """
+    actual_dir = os.path.join(log_dir, run_name) if run_name else log_dir
+    if backends is None:
+        backends = [TensorBoardBackend(actual_dir)]
     return TrainingLogger(
-        log_dir=log_dir,
+        log_dir=actual_dir,
         epochs=epochs,
-        run_name=run_name,
+        backends=backends,
         progress_type=progress_type,
         use_validation=True,
         save_csv=save_csv,
         save_batch_csv=save_batch_csv,
         save_epoch_csv=save_epoch_csv,
-        log_batch_tensorboard=log_batch_tensorboard,
+        log_batch_scalars=log_batch_tensorboard,
         resume_epoch=resume_epoch,
-        use_wandb=use_wandb,
-        wandb_project=wandb_project,
-        wandb_config=wandb_config,
-        **wandb_kwargs,
     )
 
 
 def create_self_supervised_logger(
     log_dir: str,
     epochs: int,
+    backends: Optional[List[LoggerBackend]] = None,
     run_name: Optional[str] = None,
     progress_type: Literal["tqdm", "table"] = "tqdm",
     save_csv: bool = True,
@@ -997,27 +1327,27 @@ def create_self_supervised_logger(
     save_epoch_csv: bool = True,
     log_batch_tensorboard: bool = False,
     resume_epoch: int = 0,
-    use_wandb: bool = False,
-    wandb_project: Optional[str] = None,
-    wandb_config: Optional[Dict[str, Any]] = None,
-    **wandb_kwargs,
 ) -> TrainingLogger:
-    """Create a TrainingLogger configured for self-supervised training (no validation)."""
+    """
+    Create a :class:`TrainingLogger` for self-supervised training (no validation).
+
+    When *backends* is omitted a single :class:`TensorBoardBackend` writing
+    to ``log_dir / run_name`` is created automatically.
+    """
+    actual_dir = os.path.join(log_dir, run_name) if run_name else log_dir
+    if backends is None:
+        backends = [TensorBoardBackend(actual_dir)]
     return TrainingLogger(
-        log_dir=log_dir,
+        log_dir=actual_dir,
         epochs=epochs,
-        run_name=run_name,
+        backends=backends,
         progress_type=progress_type,
         use_validation=False,
         save_csv=save_csv,
         save_batch_csv=save_batch_csv,
         save_epoch_csv=save_epoch_csv,
-        log_batch_tensorboard=log_batch_tensorboard,
+        log_batch_scalars=log_batch_tensorboard,
         resume_epoch=resume_epoch,
-        use_wandb=use_wandb,
-        wandb_project=wandb_project,
-        wandb_config=wandb_config,
-        **wandb_kwargs,
     )
 
 
@@ -1028,19 +1358,19 @@ def create_self_supervised_logger(
 def test_logger(progress_type: str = "tqdm", use_validation: bool = True):
     import tempfile, time
     mode_str = "with validation" if use_validation else "no validation (self-supervised)"
-    print("=" * 70)
-    print(f"Testing TrainingLogger  progress_type='{progress_type}'  {mode_str}")
-    print("=" * 70)
+    _test_logger = Logger(__name__)
+    _test_logger.INFO("=" * 70)
+    _test_logger.INFO(f"Testing TrainingLogger  progress_type='{progress_type}'  {mode_str}")
+    _test_logger.INFO("=" * 70)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         logger = TrainingLogger(
             log_dir=tmpdir,
             epochs=5,
+            backends=[TensorBoardBackend(tmpdir)],
             run_name=f"test_{progress_type}",
             progress_type=progress_type,
             use_validation=use_validation,
-            # W&B disabled in tests; set use_wandb=True + wandb_project="my-proj" to enable
-            use_wandb=False,
         )
 
         with logger:
@@ -1071,7 +1401,7 @@ def test_logger(progress_type: str = "tqdm", use_validation: bool = True):
                     extra_metrics={"LearningRate": 1e-3 * (0.9 ** epoch)}
                 )
 
-    print(f"\nTest done — logs: {tmpdir}")
+    _test_logger.INFO(f"Test done — logs: {tmpdir}")
 
 
 if __name__ == "__main__":
