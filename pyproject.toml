@@ -34,4 +34,5 @@ dependencies = [
     "bitsandbytes>=0.45.0",
     "liger-kernel>=0.5.10",
     "torchao>=0.11.0",
+    "nvidia-cusparselt-cu12>=0.8.1",
 ]
