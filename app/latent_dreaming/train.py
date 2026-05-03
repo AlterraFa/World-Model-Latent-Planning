@@ -3,6 +3,7 @@ import resource
 import time
 import gc
 from functools import partial
+from collections import deque
 from pathlib import Path
 from omegaconf import OmegaConf, DictConfig, ListConfig
 from ruamel.yaml import YAML
@@ -20,7 +21,6 @@ import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from utils.distributed import all_gather, all_reduce
 
@@ -43,6 +43,31 @@ from utils.logger import Logger
 from utils.early_stop import EarlyStopping, MultiModuleEarlyStopping
 
 logger = Logger(__name__)
+
+
+def _log_runtime_env_vars() -> None:
+    """Print env vars used in code with mode, default, and live value."""
+    env_specs = [
+        ("CUDA_VISIBLE_DEVICES", "write", "<none>", "entrypoint.py"),
+        ("DECODE_DIVISOR", "read", "4", "datasets/utils/decode.py"),
+        ("DECODE_THREADS", "read", "8", "datasets/utils/decode.py"),
+        ("HOSTNAME", "read", "<required by SLURM branch>", "utils/distributed.py"),
+        ("KAGGLE_KERNEL_RUN_TYPE", "read", "''", "datasets/dataset.py, utils/training_logger.py"),
+        ("KAGGLE_URL_BASE", "read", "''", "utils/training_logger.py"),
+        ("MASTER_ADDR", "write/read", "localhost", "utils/distributed.py"),
+        ("MASTER_PORT", "write", "dynamic free port", "utils/distributed.py"),
+        ("NUPLAN_TIMING", "read", "0", "datasets/dataset.py"),
+        ("SLURM_JOB_ID", "read", "<required on SLURM>", "utils/distributed.py"),
+        ("SLURM_NTASKS", "read", "<required on SLURM>", "utils/distributed.py"),
+        ("SLURM_PROCID", "read", "<required on SLURM>", "utils/distributed.py, datasets/utils/worker_init_fn.py"),
+        ("TMPDIR", "write", "<none>", "utils/distributed.py"),
+        ("WANDB_MODE", "read", "''", "utils/training_logger.py"),
+    ]
+    logger.INFO("Runtime environment variables used by this project (mode/default/current):")
+    for key, mode, default, source in env_specs:
+        logger.INFO(
+            f"  {key}: mode={mode} default={default} current={os.environ.get(key, '<unset>')} source={source}"
+        )
 
 def gpu_timer(funct, log_timming = True):
     log_timming = log_timming and torch.cuda.is_available()
@@ -208,6 +233,8 @@ def main(args: dict, yaml_path: str):
 
     torch.manual_seed(seed)
     world_size, rank = init_distributed()
+    if rank == 0:
+        _log_runtime_env_vars()
     if dist.is_available() and dist.is_initialized() and world_size > 1:
         logger.CUSTOM("SUCCESS", f"DDP enabled (world_size={world_size}, rank={rank})")
     else:
@@ -392,17 +419,18 @@ def main(args: dict, yaml_path: str):
         def sigma(t):
             return sigma_min + t * (1.0 - sigma_min)
 
-        def A_(t):
+        def A_():
             return 1.0
 
-        def B_(t):
+        def B_():
             return -(1.0 - sigma_min)
         
         def preprocessing(images, frames):
             B = images.shape[0]
-            images = images.to(device, dtype = dtype)
+            images = images.to(device, non_blocking=True, dtype=dtype)
             ego_location = ego2local(frames.ego_pose).to(device, dtype = dtype)
-            frame_rate = 1 / (frames.frame_timestamps.diff(n=1, dim=1).float().mean(-1) / 1e6).to(dtype)
+            dt = frames.frame_timestamps.diff(n=1, dim=1).float().mean(-1) / 1e6
+            frame_rate = 1 / (dt + 1e-6).to(dtype)
             diffuse_time = torch.rand((B, ), device = device, dtype = dtype)
             
             split_fpcs    = math.ceil(context_length / duration * fpcs)
@@ -423,10 +451,13 @@ def main(args: dict, yaml_path: str):
         
         @torch.no_grad()
         def ema_update(decay):
-            params_k = list(ema_wm.parameters())
-            params_q_cpu = [p.to("cpu", non_blocking=True) for p in world_model.parameters()]
+            params_k = []
+            params_q = []
+            for param_q, param_k in zip(world_model.parameters(), ema_wm.parameters()):
+                params_k.append(param_k)
+                params_q.append(param_q)
             torch._foreach_mul_(params_k, decay)
-            torch._foreach_add_(params_k, params_q_cpu, alpha=1 - decay)
+            torch._foreach_add_(params_k, params_q, alpha=1 - decay)
             
         
         
@@ -440,9 +471,9 @@ def main(args: dict, yaml_path: str):
                 frame_rate,
                 diffuse_time,
             ) = preprocessing(images, frames)
+            
 
-
-            velocity = A_(diffuse_time) * latent_target + B_(diffuse_time) * noise
+            velocity = A_() * latent_target + B_() * noise
             pred_vel = world_model(
                 x = context_image,
                 noise = noisy_target,
@@ -451,15 +482,17 @@ def main(args: dict, yaml_path: str):
                 frame_rate = frame_rate
             )
             
-            loss: torch.Tensor = (((pred_vel - velocity) ** loss_exp) / loss_exp)
+            loss: torch.Tensor = torch.abs(pred_vel - velocity) ** loss_exp
             loss_pstep = loss.mean((0, 2, 3, 4))
             loss = loss.mean()
+            
 
         if mixed_precision:
             scaler.scale(loss).backward()
             scaler.unscale_(optim)
         else:
             loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(world_model.parameters(), max_norm=1.0).item()  
             
         if mixed_precision:
             scaler.step(optim)
@@ -477,6 +510,7 @@ def main(args: dict, yaml_path: str):
         return (
             loss, 
             loss_pstep,
+            grad_norm,
             _new_lr,
             _new_wd
         )
@@ -490,6 +524,10 @@ def main(args: dict, yaml_path: str):
 
     with log_stats:
         log_stats.start_training("Diffusion World Model conditioned on Goal")
+        logger.INFO(
+            "Convergence diagnostics enabled: Diag/ZeroBaselineRatio < 1 and "
+            "Diag/ExplainedVar > 0 indicate learning even when raw Loss is ~1.0"
+        )
         sampler.set_epoch(start_epoch)
         
         for epoch in range(start_epoch, num_epochs):
@@ -523,7 +561,13 @@ def main(args: dict, yaml_path: str):
                 if frames is None or images is None:
                     continue
 
-                (loss, loss_pstep, curr_lr, curr_wd), elapsed_time = gpu_timer(partial(train_step, frames, images))
+                (
+                    loss,
+                    loss_pstep,
+                    grad_norm,
+                    curr_lr,
+                    curr_wd,
+                ), elapsed_time = gpu_timer(partial(train_step, frames, images))
 
                 loss_val = loss.item()
                 if np.isnan(loss_val) or np.isinf(loss_val):
@@ -537,13 +581,14 @@ def main(args: dict, yaml_path: str):
                     "WD":       curr_wd,
                     "Loss":     loss_val,
                     "Fetch_ms": _fetch_ms,
-                    "Step_ms":  elapsed_time,
+                    "Step_ms": elapsed_time,
                 }
                 if _sample_timing is not None:
                     for k, v in _sample_timing.items():
                         batch_metrics[f"DB/{k}"] = v
                 for step_i, step_loss in enumerate(loss_pstep.tolist()):
                     batch_metrics[f"Loss|t{step_i}"] = step_loss
+                batch_metrics['Gradnorm'] = grad_norm
 
                 log_stats.log_batch(batch_metrics)
 

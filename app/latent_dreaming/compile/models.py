@@ -11,8 +11,8 @@ logger = Logger('compile_model')
 
 def compile_model(cfg: dict = None, device = torch.device('cpu')) -> tuple[nn.Module, nn.Module]:
     model  = instantiate_from_config(cfg)
-    ema_wm = copy.deepcopy(model)
     model  = model.to(device)
+    ema_wm = copy.deepcopy(model)
 
     log_parameters(logger, model.__class__.__name__, cfg)
 
