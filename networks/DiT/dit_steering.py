@@ -91,9 +91,17 @@ class LinearGoalEmbedder(torch.nn.Module):
         embeddings = []
         for i in range(num_features):
             feature = goal[:, [i]]
-            embedding = self.embedders[i](feature)
-            # replace NaN values with no_value_embedding
-            embedding = torch.where(torch.isnan(embedding), self.no_value_embeddings[i].expand(b, -1), embedding)
+            nan_mask = torch.isnan(feature)  # (B, 1) — computed on INPUT before linear
+            # Pass zero instead of NaN so d(loss)/d(weight) = grad * 0 (not grad * NaN).
+            # IEEE 754: 0 * NaN = NaN, so feeding NaN through the linear poisons all
+            # weight gradients even when torch.where cleans the forward output.
+            embedding = self.embedders[i](feature.nan_to_num(nan=0.0))
+            # Replace positions that were NaN-input with the learnable null embedding.
+            embedding = torch.where(
+                nan_mask.expand_as(embedding),
+                self.no_value_embeddings[i].to(dtype=embedding.dtype).expand(b, -1),
+                embedding,
+            )
             embeddings.append(embedding)
         goal_embedding = torch.stack(embeddings, dim=1).sum(dim=1)
         return goal_embedding
