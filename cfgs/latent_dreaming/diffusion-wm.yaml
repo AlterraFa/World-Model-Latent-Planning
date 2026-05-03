@@ -3,23 +3,27 @@ app: latent_dreaming
 common: &common_settings
   patch_size: 16
   tubelet_size: 2
-  crop_size: 288
+  crop_size: &crop_size 288
   fpcs: 16
 
 loader:
   batch_size: 20
   num_workers: 4
   persistent_workers: true
-  pin_mem: true
-  dataset_config:
-    <<: *common_settings
-    n_clips: 1
-    duration: 10.0
-    random_jiggle_part: true
-    allow_overlap: true
-    random_jiggle: true
-    channel: "F0"
-    datasets_root: "./nuplan_dataset/"
+  pin_memory: false
+  dataset:
+    target: datasets.dataset.NuplanNumpyDataset  # or NuplanSQLiteDataset
+    params:
+      <<: *common_settings
+      data_root: "./nuplan_dataset/"  # root scanned for .npz / .db files
+      db_scan_depth: 3
+      image_root: "./nuplan_dataset/"
+      duration_s: 10.0
+      n_clips: 1
+      allow_clip_overlap: true
+      random_jiggle_part: true
+  collator:
+    target: datasets.collator.CollateNuplan  # or CollateNuplan
 
 model: 
   target: models.diffusion_wm.DiffusionWM
@@ -123,3 +127,10 @@ logging:
         run_name: null                # filled in with run_name
         log_dir: null                 # filled in with run_dir
         resume: null                  # "allow" when resuming, else None
+
+    # - target: utils.training_logger.MLflowBackend
+    #   params:
+    #     experiment_name: latent_dreaming
+    #     run_name: null
+    #     tracking_uri: http://localhost:5000
+    #     log_model_artifact: false

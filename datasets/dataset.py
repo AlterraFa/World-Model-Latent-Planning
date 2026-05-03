@@ -1,6 +1,7 @@
 import bisect
 import os, sys
 import pickle
+import time
 
 script_dir = os.path.dirname(__file__)
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
@@ -23,7 +24,7 @@ from .utils.metadata import (
     NuplanFrame,
     TrafficLight     
 )
-from .utils.decode import decode_batch
+from .utils.decode import decode_batch, start_decode_batch, collect_decode_batch
 from rich import print
 
 
@@ -33,7 +34,10 @@ if IS_KAGGLE_COMMIT:
 else:
     from tqdm.auto import tqdm
 
-class NuplanDataset(Dataset):
+# Set NUPLAN_TIMING=1 to print per-phase timing for every sample.
+_TIMING = os.environ.get('NUPLAN_TIMING', '0') == '1'
+
+class NuplanSQLiteDataset(Dataset):
     """Action-conditioned video dataset backed by NuPlan SQLite databases.
 
     Each sample is one log entry. The loader picks ``n_clips`` time windows
@@ -108,7 +112,7 @@ class NuplanDataset(Dataset):
                             self._log_dirs[sub.name] = entry.path
             print(f"[Dataset] Found {len(self._log_dirs)} log dirs.")
 
-        _cache_path = ".cache/dataset_cache.pkl"
+        _cache_path = ".cache/dataset_cache_v2.pkl"
         _db_set = set(database_paths)
         _cached_db_set: set = set()
         if os.path.exists(_cache_path):
@@ -166,6 +170,16 @@ class NuplanDataset(Dataset):
             # check_same_thread=False is important for SQLite in multi-threaded envs
             con = sqlite3.connect(db_path, check_same_thread=False)
             con.row_factory = sqlite3.Row
+            # Limit per-connection page cache to prevent RAM growth in workers.
+            # On Kaggle the DB lives on a slow NFS mount — a larger cache cuts
+            # repeated page re-reads significantly.
+            _sql_cache_kb = 16 * 1024 if IS_KAGGLE_COMMIT else 512
+            con.execute(f"PRAGMA cache_size = -{_sql_cache_kb}")
+            con.execute("PRAGMA temp_store = MEMORY")
+            # Memory-map the DB file so the OS page cache handles NFS reads.
+            # 256 MB on Kaggle; disabled locally (0 = OS default).
+            _mmap = 256 * 1024 * 1024 if IS_KAGGLE_COMMIT else 0
+            con.execute(f"PRAGMA mmap_size = {_mmap}")
             self._local.conns[db_path] = con
         return self._local.conns[db_path]
 
@@ -174,31 +188,21 @@ class NuplanDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _build_log_time_cache(self, con, log_token_bytes):
-        log_lp_rows = self._get_log_lidar_rows(con, log_token_bytes)
-        if not log_lp_rows:
+        all_cam_rows = self._get_log_camera_rows(con, log_token_bytes)
+        cam_rows = [(row["filename_jpg"], row["timestamp"]) for row in all_cam_rows]
+        cam_timestamps = [row[1] for row in cam_rows]
+
+        if not cam_rows:
             return {
                 "anchor_ts": 0,
                 "anchor_token": "",
-                "lp_timestamps": [],
-                "lp_tokens_raw": [],
                 "cam_rows": [],
                 "cam_timestamps": [],
             }
 
-        anchor_ts = log_lp_rows[0]["timestamp"]
-        anchor_token = log_lp_rows[0]["token"].hex()
-        lp_timestamps = [row["timestamp"] for row in log_lp_rows]
-        lp_tokens_raw = [row["token"] for row in log_lp_rows]
-
-        all_cam_rows = self._get_log_camera_rows(con, log_lp_rows)
-        cam_rows = [(row["filename_jpg"], row["timestamp"]) for row in all_cam_rows]
-        cam_timestamps = [row[1] for row in cam_rows]
-
         return {
-            "anchor_ts": anchor_ts,
-            "anchor_token": anchor_token,
-            "lp_timestamps": lp_timestamps,
-            "lp_tokens_raw": lp_tokens_raw,
+            "anchor_ts": cam_rows[0][1],
+            "anchor_token": log_token_bytes.hex(),
             "cam_rows": cam_rows,
             "cam_timestamps": cam_timestamps,
         }
@@ -223,56 +227,46 @@ class NuplanDataset(Dataset):
     # Log-scoped helpers
     # ------------------------------------------------------------------
 
-    def _get_log_token(self, con, token_bytes):
-        row = con.execute(
-            """
-            SELECT ld.log_token
-            FROM lidar_pc AS lp
-            INNER JOIN lidar AS ld ON ld.token = lp.lidar_token
-            WHERE lp.token = ?
-            """,
-            (token_bytes,),
-        ).fetchone()
-        return row["log_token"] if row else None
-
-    def _get_log_lidar_rows(self, con, log_token):
-        return con.execute(
-            """
-            SELECT lp.token, lp.timestamp
-            FROM lidar_pc AS lp
-            INNER JOIN lidar AS ld ON ld.token = lp.lidar_token
-            WHERE ld.log_token = ?
-            ORDER BY lp.timestamp ASC
-            """,
-            (log_token,),
-        ).fetchall()
-
-    def _get_log_camera_rows(self, con, log_lp_rows):
-        if not log_lp_rows:
-            return []
-        t_min = log_lp_rows[0]["timestamp"]
-        t_max = log_lp_rows[-1]["timestamp"]
+    def _get_log_camera_rows(self, con, log_token_bytes):
         return con.execute(
             """
             SELECT img.filename_jpg, img.timestamp
             FROM image AS img
             INNER JOIN camera AS cam ON cam.token = img.camera_token
-            WHERE cam.channel = ?
-              AND img.timestamp BETWEEN ? AND ?
+            WHERE cam.log_token = ?
+              AND cam.channel = ?
             ORDER BY img.timestamp ASC
             """,
-            (self.channel, t_min, t_max),
+            (log_token_bytes, self.channel),
         ).fetchall()
 
-    def _bisect_nearest_lidar(self, lp_timestamps, lp_tokens, img_ts):
-        idx = bisect.bisect_left(lp_timestamps, img_ts)
+    def _get_lp_tokens_in_range(self, con, log_token_bytes, t_min, t_max):
+        """One query: all lidar_pc (token, timestamp) covering [t_min-200ms, t_max+200ms]."""
+        rows = con.execute(
+            """
+            SELECT lp.token, lp.timestamp
+            FROM lidar_pc AS lp
+            INNER JOIN lidar AS ld ON ld.token = lp.lidar_token
+            WHERE ld.log_token = ?
+              AND lp.timestamp BETWEEN ? AND ?
+            ORDER BY lp.timestamp ASC
+            """,
+            (log_token_bytes, t_min - 200_000, t_max + 200_000),
+        ).fetchall()
+        return rows
+
+    def _bisect_nearest_token(self, ts_list, tok_list, target_ts):
+        """Binary search for the nearest lidar_pc token in sorted ts_list."""
+        if not ts_list:
+            return None
+        idx = bisect.bisect_left(ts_list, target_ts)
         if idx == 0:
-            return lp_tokens[0], lp_timestamps[0]
-        if idx >= len(lp_timestamps):
-            return lp_tokens[-1], lp_timestamps[-1]
-        if lp_timestamps[idx] - img_ts <= img_ts - lp_timestamps[idx - 1]:
-            return lp_tokens[idx], lp_timestamps[idx]
-        return lp_tokens[idx - 1], lp_timestamps[idx - 1]
+            return tok_list[0]
+        if idx >= len(ts_list):
+            return tok_list[-1]
+        if ts_list[idx] - target_ts <= target_ts - ts_list[idx - 1]:
+            return tok_list[idx]
+        return tok_list[idx - 1]
 
     # ------------------------------------------------------------------
     # Batch metadata queries
@@ -457,8 +451,6 @@ class NuplanDataset(Dataset):
         sampled_cam_rows,
         anchor_token,
         anchor_ts,
-        lp_timestamps,
-        lp_tokens_raw,
         log_token_bytes,
     ):
         """Build one clip dict from a list of sampled camera rows."""
@@ -484,7 +476,21 @@ class NuplanDataset(Dataset):
                 "meta": empty_meta,
             }
 
-        # ── 4. Bisect-lookup nearest lidar_pc for each sampled frame ───
+        # ── 4. One range query for all lp tokens, then bisect per frame ─────
+        img_timestamps_list = [row[1] for row in sampled_cam_rows]
+        _t0 = time.perf_counter() if _TIMING else 0.0
+        if img_timestamps_list:
+            lp_range = self._get_lp_tokens_in_range(
+                con, log_token_bytes,
+                min(img_timestamps_list), max(img_timestamps_list),
+            )
+            lp_ts_list  = [r["timestamp"] for r in lp_range]
+            lp_tok_list = [r["token"]     for r in lp_range]
+        else:
+            lp_ts_list  = []
+            lp_tok_list = []
+        _t_lp = (time.perf_counter() - _t0) * 1000 if _TIMING else 0.0
+
         image_paths             = []
         frame_tokens_hex        = []
         frame_timestamps        = []
@@ -493,10 +499,14 @@ class NuplanDataset(Dataset):
         for cam_row in sampled_cam_rows:
             filename_jpg, img_ts = cam_row
             image_paths.append(self._resolve_image_path(filename_jpg))
-            lp_tok, lp_ts = self._bisect_nearest_lidar(lp_timestamps, lp_tokens_raw, img_ts)
+            lp_tok = self._bisect_nearest_token(lp_ts_list, lp_tok_list, img_ts)
             frame_tokens_hex.append(lp_tok.hex() if lp_tok is not None else "")
-            frame_timestamps.append(lp_ts if lp_ts is not None else img_ts)
+            frame_timestamps.append(img_ts)
             lp_token_bytes_per_frame.append(lp_tok)
+
+        # ── 4b. Submit image reads to background threads NOW (before meta SQL)
+        #        so I/O overlaps with the ego_pose / agents queries below.
+        _img_executor, _img_futures = start_decode_batch(image_paths)
 
         # ── 5. Batch metadata queries ───────────────────────────────────
         valid_lp_tokens = [t for t in lp_token_bytes_per_frame if t is not None]
@@ -506,6 +516,7 @@ class NuplanDataset(Dataset):
         tl_map:       dict = {}
         tags_map:     dict = {}
 
+        _t1 = time.perf_counter() if _TIMING else 0.0
         if valid_lp_tokens:
             if "ego_pose" in self.meta_keys:
                 ego_pose_map = self._batch_query_ego_pose(con, valid_lp_tokens)
@@ -515,6 +526,7 @@ class NuplanDataset(Dataset):
                 tl_map = self._batch_query_traffic_lights(con, valid_lp_tokens)
             if "scenario_tags" in self.meta_keys:
                 tags_map = self._batch_query_scenario_tags(con, valid_lp_tokens)
+        _t_meta = (time.perf_counter() - _t1) * 1000 if _TIMING else 0.0
 
         # ── 6. Assemble per-frame lists ─────────────────────────────────
         ego_pose       = []
@@ -573,19 +585,51 @@ class NuplanDataset(Dataset):
                 },
             }
 
-        images = decode_batch(image_paths)
+        _t2 = time.perf_counter() if _TIMING else 0.0
+        # Collect image futures submitted before the meta queries.
+        # If start_decode_batch returned no executor (e.g. single image or
+        # threading disabled), fall back to synchronous decode_batch.
+        if _img_executor is not None:
+            images = collect_decode_batch(_img_executor, _img_futures, len(image_paths))
+        else:
+            images = decode_batch(image_paths)
+        _t_img = (time.perf_counter() - _t2) * 1000 if _TIMING else 0.0
 
         if self.individual_transform is not None:
             images = np.array([self.individual_transform(img) for img in images])
+        _t3 = time.perf_counter() if _TIMING else 0.0
         if self.shared_transform is not None:
             images = self.shared_transform(images)
+        _t_xfrm = (time.perf_counter() - _t3) * 1000 if _TIMING else 0.0
+
+        _timing_ms: dict | None = None
+        if _TIMING:
+            _t_total = _t_lp + _t_meta + _t_img + _t_xfrm
+            _timing_ms = {
+                "lp_query_ms": round(_t_lp, 2),
+                "meta_ms":     round(_t_meta, 2),
+                "img_ms":      round(_t_img, 2),
+                "xfrm_ms":     round(_t_xfrm, 2),
+                "total_ms":    round(_t_total, 2),
+            }
+            sys.stderr.write(
+                f"[nuplan timing] "
+                f"lp_query={_t_lp:6.1f}ms  "
+                f"meta={_t_meta:6.1f}ms  "
+                f"img_decode={_t_img:6.1f}ms  "
+                f"transform={_t_xfrm:6.1f}ms  "
+                f"total={_t_total:6.1f}ms  "
+                f"n_frames={len(image_paths)}\n"
+            )
+            sys.stderr.flush()
 
         return {
-            "images": images,
+            "images":   images,
             "ego_pose": ego_pose_np,
-            "agents": agents,
+            "agents":         agents,
             "traffic_lights": traffic_lights,
-            "scenario_tags": scenario_tags,
+            "scenario_tags":  scenario_tags,
+            "timing_ms":      _timing_ms,
             "meta": {
                 "token": anchor_token,
                 "timestamp": anchor_ts,
@@ -612,11 +656,6 @@ class NuplanDataset(Dataset):
             cache = self._build_log_time_cache(con, log_token_bytes)
             self._log_time_cache[(db_path, log_token_hex)] = cache
 
-        lp_timestamps = cache["lp_timestamps"]
-        lp_tokens_raw = cache["lp_tokens_raw"]
-        if not lp_timestamps:
-            return None
-
         anchor_ts    = cache["anchor_ts"]
         anchor_token = cache["anchor_token"]
 
@@ -624,6 +663,9 @@ class NuplanDataset(Dataset):
         cam_timestamps  = cache["cam_timestamps"]
 
         if not all_cam_rows:
+            return None
+
+        if not cam_timestamps:
             empty_clip = {
                 "images": None,
                 "ego_pose": np.zeros((0, 7), dtype=np.float32),
@@ -644,10 +686,10 @@ class NuplanDataset(Dataset):
             }
             return {"clips": [empty_clip] * self.n_clips}
 
-        # ── 3. Sample n_clips window start positions ───────────────────
-        duration_us    = int(self.duration_s * 1_000_000)
-        t_first        = cam_timestamps[0]
-        t_last         = cam_timestamps[-1]
+        # ── 3. Sample n_clips window start positions via camera timestamps ──
+        duration_us     = int(self.duration_s * 1_000_000)
+        t_first         = cam_timestamps[0]
+        t_last          = cam_timestamps[-1]
         start_positions = self._sample_clip_start_positions(t_first, t_last)
 
         # ── Build one sampled_cam_rows list per clip, then call _build_clip ──
@@ -668,106 +710,294 @@ class NuplanDataset(Dataset):
             clips.append(
                 self._build_clip(
                     con, sampled_cam_rows, anchor_token, anchor_ts,
-                    lp_timestamps, lp_tokens_raw, log_token_bytes,
+                    log_token_bytes,
                 )
             )
 
         return {"clips": clips}
 
-def collate_nuplan(batch):
-    # Filter out failed samples
-    batch = [item for item in batch if item is not None]
-    if not batch:
-        return None, None
+class NuplanNumpyDataset(Dataset):
+    """Action-conditioned video dataset backed by pre-distilled ``.npz`` files.
 
-    # Support dict-based samples from load_sequences.
-    if isinstance(batch[0], dict):
-        images_list = [item.get("images") for item in batch]
-        frames = []
-        for item in batch:
-            if "frame" in item and item["frame"] is not None:
-                frames.append(item["frame"])
+    Each sample is one log entry.  The loader picks ``n_clips`` time windows
+    of ``duration_s`` seconds from that log and returns them as a
+    ``{"clips": [...]}`` dict, exactly like ``NuplanDataset``.
+    ``CollateNpz`` (or the original ``CollateNuplan``) flattens the clips so
+    the effective batch size is ``B * n_clips``.
+
+    Only ``"ego_pose"`` metadata is available (agents, traffic lights, and
+    scenario tags are returned as empty lists).  All other parameters match
+    ``NuplanDataset`` 1-to-1.
+
+    Args:
+        npz_paths:           Iterable of ``.npz`` file paths produced by
+                             ``distill_to_npz.py``.
+        image_root:          Root directory prepended to image.filename_jpg.
+        fpcs:                Camera frames to return per clip.
+        duration_s:          Length of each time window in seconds.
+        random_jiggle_part:  Randomly shift sampled window starts.
+        shared_transform:    Applied to the decoded image array (N, H, W, C).
+        individual_transform:Applied per-frame before stacking.
+        n_clips:             Number of temporal clips per log.
+        allow_clip_overlap:  See ``NuplanDataset`` for semantics.
+    """
+
+    def __init__(
+        self,
+        npz_paths,
+        image_root: str = "./",
+        fpcs: int = 16,
+        duration_s: float = 10.0,
+        random_jiggle_part: bool = True,
+        shared_transform=None,
+        individual_transform=None,
+        n_clips: int = 1,
+        allow_clip_overlap: bool = True,
+    ):
+        super().__init__()
+        self.image_root = image_root
+        self.fpcs = fpcs
+        self.duration_s = duration_s
+        self.random_jiggle_part = random_jiggle_part
+        self.individual_transform = individual_transform
+        self.shared_transform = shared_transform
+        self.n_clips = max(1, int(n_clips))
+        self.allow_clip_overlap = allow_clip_overlap
+
+        # ── Build log-dir lookup (same as NuplanDataset) ──────────────────
+        self._log_dirs: dict[str, str] = {}
+        image_root_abs = os.path.abspath(image_root)
+        if os.path.isdir(image_root_abs):
+            print(f"[NpzDataset] Scanning log dirs under {image_root_abs} …")
+            for entry in os.scandir(image_root_abs):
+                if entry.is_dir():
+                    for sub in os.scandir(entry.path):
+                        if sub.is_dir() and sub.name not in self._log_dirs:
+                            self._log_dirs[sub.name] = entry.path
+            print(f"[NpzDataset] Found {len(self._log_dirs)} log dirs.")
+
+        # ── Load index from .npz files ────────────────────────────────────
+        self.samples: list[tuple[str, str]] = []
+        self._log_time_cache: dict[tuple[str, str], dict] = {}
+
+        npz_list = list(npz_paths)
+        print(f"[NpzDataset] Indexing {len(npz_list)} npz file(s) …")
+        for npz_path in tqdm(npz_list, desc="Loading NPZ index"):
+            npz_path = str(npz_path)
+            try:
+                data = np.load(npz_path, allow_pickle=True)
+            except Exception as exc:
+                print(f"[NpzDataset] WARNING – could not load {npz_path}: {exc}")
                 continue
-            frames.append(sample_dict_to_nuplan_frame(item))
-    else:
-        # Backward compatibility for tuple/list sample format.
-        frames, images_list = zip(*batch)
 
-    valid_pairs = [(f, i) for f, i in zip(frames, images_list) if f is not None]
-    if not valid_pairs:
-        return None, None
-    frames, images_list = zip(*valid_pairs)
+            log_token_hex   = str(data["log_token"])
+            timestamps      = data["timestamps"].astype(np.int64)
+            image_paths_arr = data["image_paths"]
+            ego_pose_arr    = data["ego_pose"].astype(np.float32)
 
-    # Stack images → (B, N, H, W, C) tensor; pad missing with zeros
-    stacked_images = None
-    valid_images = [img for img in images_list if img is not None]
-    if valid_images:
-        ref_shape = valid_images[0].shape  # (N, H, W, C)
-        arrays = [
-            img if img is not None else np.zeros(ref_shape, dtype=np.uint8)
-            for img in images_list
+            if len(timestamps) == 0:
+                continue
+
+            cam_rows       = list(zip(image_paths_arr.tolist(), timestamps.tolist()))
+            cam_timestamps = timestamps.tolist()
+
+            key = (npz_path, log_token_hex)
+            self.samples.append(key)
+            self._log_time_cache[key] = {
+                "anchor_ts":      int(timestamps[0]),
+                "anchor_token":   log_token_hex,
+                "cam_rows":       cam_rows,
+                "cam_timestamps": cam_timestamps,
+                "ego_pose_arr":   ego_pose_arr,   # (N, 7) float32
+            }
+
+        print(f"[NpzDataset] Indexed {len(self.samples)} log(s).")
+
+    # ------------------------------------------------------------------
+    # Image path resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_image_path(self, filename_jpg: str) -> str:
+        log_name = filename_jpg.split("/")[0]
+        base = self._log_dirs.get(log_name, self.image_root)
+        return os.path.join(base, filename_jpg)
+
+    # ------------------------------------------------------------------
+    # Dataset protocol
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        for retry in range(5):
+            try:
+                sample = self.load_sequences(index)
+                if sample is not None:
+                    return sample
+            except Exception as exc:
+                if retry < 4:
+                    print(f"[NpzDataset] Error at {index=}, retrying ({retry+1}/5): {exc}")
+                else:
+                    print(f"[NpzDataset] Failed at {index=} after 5 retries: {exc}")
+        return None
+
+    # ------------------------------------------------------------------
+    # Clip window sampling (mirrors NuplanDataset exactly)
+    # ------------------------------------------------------------------
+
+    def _sample_clip_start_positions(self, t_first: int, t_last: int) -> list[int]:
+        duration_us = int(self.duration_s * 1_000_000)
+        max_start   = t_last - duration_us
+
+        if max_start <= t_first:
+            return [t_first] * self.n_clips
+
+        if self.n_clips == 1:
+            if self.random_jiggle_part:
+                return [int(np.random.randint(t_first, max_start + 1))]
+            return [t_first]
+
+        if not self.allow_clip_overlap:
+            max_overlap_us = int(duration_us * 0.10)
+            min_step_us    = duration_us - max_overlap_us
+            required_span  = min_step_us * (self.n_clips - 1) + duration_us
+            available_span = t_last - t_first
+
+            if required_span <= available_span:
+                slack       = available_span - required_span
+                first_start = t_first + slack // 2
+                base_starts = [first_start + i * min_step_us for i in range(self.n_clips)]
+            else:
+                step        = available_span // self.n_clips
+                base_starts = [t_first + i * step for i in range(self.n_clips)]
+
+            if self.random_jiggle_part:
+                step_us = (base_starts[1] - base_starts[0]) if len(base_starts) > 1 else min_step_us
+                jiggle  = max(1, int(step_us * 0.20))
+                return [
+                    int(np.clip(s + np.random.randint(-jiggle, jiggle + 1), t_first, max_start))
+                    for s in base_starts
+                ]
+            return [int(np.clip(s, t_first, max_start)) for s in base_starts]
+
+        # allow_clip_overlap=True
+        if self.random_jiggle_part:
+            return [int(np.random.randint(t_first, max_start + 1)) for _ in range(self.n_clips)]
+        return [
+            int(t_first + i * (max_start - t_first) / (self.n_clips - 1))
+            for i in range(self.n_clips)
         ]
-        stacked_images = torch.from_numpy(np.stack(arrays, axis=0))
 
-    batched_frame = NuplanFrame(
-        token=[f.token for f in frames],
-        timestamp=[f.timestamp for f in frames],
-        image_paths=[f.image_paths for f in frames],
-        frame_tokens=[f.frame_tokens for f in frames],
-        frame_timestamps=[f.frame_timestamps for f in frames],
-        ego_pose=[f.ego_pose for f in frames],
-        agents=[f.agents for f in frames],
-        traffic_lights=[f.traffic_lights for f in frames],
-        scenario_tags=[f.scenario_tags for f in frames],
-        map_version=[f.map_version for f in frames],
-        vehicle_name=[f.vehicle_name for f in frames],
-        scene_name=[f.scene_name for f in frames],
-        roadblock_ids=[f.roadblock_ids for f in frames],
-    )
+    # ------------------------------------------------------------------
+    # Clip builder
+    # ------------------------------------------------------------------
 
-    return batched_frame, stacked_images
+    def _build_clip(
+        self,
+        sampled_cam_rows: list[tuple[str, int]],
+        sampled_ego_pose: np.ndarray,
+        anchor_token: str,
+        anchor_ts: int,
+    ) -> dict:
+        empty_meta = {
+            "token": anchor_token, "timestamp": anchor_ts,
+            "image_paths": [], "frame_tokens": [], "frame_timestamps": [],
+            "map_version": "", "vehicle_name": "", "scene_name": "", "roadblock_ids": [],
+        }
+        if not sampled_cam_rows:
+            return {
+                "images": None, "ego_pose": np.zeros((0, 7), dtype=np.float32),
+                "agents": [], "traffic_lights": [], "scenario_tags": [],
+                "timing_ms": None, "meta": empty_meta,
+            }
 
+        image_paths      = [self._resolve_image_path(row[0]) for row in sampled_cam_rows]
+        frame_timestamps = [row[1] for row in sampled_cam_rows]
+        frame_tokens_hex = [""] * len(sampled_cam_rows)
 
-def ego_pose_array_to_list(ego_pose_arr, frame_ts):
-    if ego_pose_arr is None:
-        return []
-    ego_pose_arr = np.asarray(ego_pose_arr)
-    if ego_pose_arr.size == 0:
-        return []
+        # Submit image reads before any CPU work (no SQL to overlap, but
+        # keeps the same decode path — with DCT-domain scaling — as NuplanDataset).
+        _img_executor, _img_futures = start_decode_batch(image_paths)
 
-    ts_list = list(frame_ts) if frame_ts is not None else []
-    poses = []
-    for idx, row in enumerate(ego_pose_arr):
-        if np.isnan(row).all():
-            poses.append(None)
-            continue
-        ts = ts_list[idx] if idx < len(ts_list) else 0
-        poses.append(EgoPose(
-            timestamp=int(ts),
-            x=float(row[0]), y=float(row[1]), z=float(row[2]),
-            qw=float(row[3]), qx=float(row[4]), qy=float(row[5]), qz=float(row[6]),
-            vx=0.0, vy=0.0, vz=0.0,
-            acceleration_x=0.0, acceleration_y=0.0, acceleration_z=0.0,
-            angular_rate_x=0.0, angular_rate_y=0.0, angular_rate_z=0.0,
-        ))
-    return poses
+        # ego_pose array: (N, 7) float32
+        if sampled_ego_pose.size > 0:
+            ego_pose_np = np.asarray(sampled_ego_pose, dtype=np.float32)
+        else:
+            ego_pose_np = np.full((len(sampled_cam_rows), 7), np.nan, dtype=np.float32)
 
+        # Collect images
+        if _img_executor is not None:
+            images = collect_decode_batch(_img_executor, _img_futures, len(image_paths))
+        else:
+            images = decode_batch(image_paths)
 
-def sample_dict_to_nuplan_frame(sample):
-    meta = sample.get("meta") or {}
-    frame_ts = meta.get("frame_timestamps", [])
-    return NuplanFrame(
-        token=meta.get("token", ""),
-        timestamp=meta.get("timestamp", 0),
-        image_paths=meta.get("image_paths", []),
-        frame_tokens=meta.get("frame_tokens", []),
-        frame_timestamps=frame_ts,
-        ego_pose=ego_pose_array_to_list(sample.get("ego_pose"), frame_ts),
-        agents=sample.get("agents", []),
-        traffic_lights=sample.get("traffic_lights", []),
-        scenario_tags=sample.get("scenario_tags", []),
-        map_version=meta.get("map_version", ""),
-        vehicle_name=meta.get("vehicle_name", ""),
-        scene_name=meta.get("scene_name", ""),
-        roadblock_ids=meta.get("roadblock_ids", []),
-    )
+        if images is not None and self.individual_transform is not None:
+            images = np.array([self.individual_transform(img) for img in images])
+        if images is not None and self.shared_transform is not None:
+            images = self.shared_transform(images)
+
+        return {
+            "images":         images,
+            "ego_pose":       ego_pose_np,
+            "agents":         [],
+            "traffic_lights": [],
+            "scenario_tags":  [],
+            "timing_ms":      None,
+            "meta": {
+                "token":            anchor_token,
+                "timestamp":        anchor_ts,
+                "image_paths":      image_paths,
+                "frame_tokens":     frame_tokens_hex,
+                "frame_timestamps": frame_timestamps,
+                "map_version":      "",
+                "vehicle_name":     "",
+                "scene_name":       "",
+                "roadblock_ids":    [],
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def load_sequences(self, index: int) -> dict | None:
+        key   = self.samples[index]
+        cache = self._log_time_cache[key]
+
+        anchor_ts       = cache["anchor_ts"]
+        anchor_token    = cache["anchor_token"]
+        all_cam_rows    = cache["cam_rows"]
+        cam_timestamps  = cache["cam_timestamps"]
+        ego_pose_arr    = cache["ego_pose_arr"]
+
+        if not all_cam_rows:
+            return None
+
+        duration_us     = int(self.duration_s * 1_000_000)
+        t_first         = cam_timestamps[0]
+        t_last          = cam_timestamps[-1]
+        start_positions = self._sample_clip_start_positions(t_first, t_last)
+
+        fpcs  = max(1, self.fpcs)
+        clips = []
+        for start_ts in start_positions:
+            end_ts  = start_ts + duration_us
+            i_start = bisect.bisect_left(cam_timestamps,  start_ts)
+            i_end   = bisect.bisect_right(cam_timestamps, end_ts)
+            window  = all_cam_rows[i_start:i_end]
+            ep_win  = ego_pose_arr[i_start:i_end]
+
+            if len(window) <= fpcs:
+                sampled_rows     = window
+                sampled_ego_pose = ep_win
+            else:
+                indices          = np.linspace(0, len(window) - 1, fpcs, dtype=int)
+                sampled_rows     = [window[i] for i in indices]
+                sampled_ego_pose = ep_win[indices]
+
+            clips.append(
+                self._build_clip(sampled_rows, sampled_ego_pose, anchor_token, anchor_ts)
+            )
+
+        return {"clips": clips}

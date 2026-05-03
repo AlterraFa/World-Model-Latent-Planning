@@ -8,19 +8,22 @@ common: &common_settings
 
 loader:
   batch_size: 8
-  num_workers: 2
+  num_workers: 4
   persistent_workers: true
-  pin_mem: true
-  dataset_config:
-    <<: *common_settings
-    n_clips: 1
-    duration: 10.0
-    random_jiggle_part: true
-    allow_overlap: true
-    random_jiggle: true
-    channel: "F0"
-    datasets_root: "./nuplan_dataset/"
-    db_scan_depth: 3  # max depth to search for .db files from datasets_root
+  pin_memory: false
+  dataset:
+    target: datasets.dataset.NuplanNumpyDataset  # or NuplanSQLiteDataset
+    params:
+      <<: *common_settings
+      data_root: "./nuplan_dataset/"  # root scanned for .npz / .db files
+      db_scan_depth: 3
+      image_root: "./nuplan_dataset/"
+      duration_s: 10.0
+      n_clips: 1
+      allow_clip_overlap: true
+      random_jiggle_part: true
+  collator:
+    target: datasets.collator.CollateNpz  # or CollateNuplan
 
 model: 
   target: models.diffusion_goal.DiffusionGoal
@@ -42,7 +45,7 @@ model:
       target: networks.DiT.dit_steering.STDiTGoalConditioned
       params:
         max_num_frames: 64
-        diffuse_dim: &diffuse_dim 512
+        diffuse_dim: &diffuse_dim 768
         depth: 16
         num_heads: 16
         mlp_ratio: 4
@@ -131,8 +134,6 @@ logging:
         run_name: null                # filled in with run_name
         log_dir: null                 # filled in with run_dir
         resume: null                  # "allow" when resuming, else None
-        # entity: my_team            # uncomment to set W&B team
-        # mode: offline              # uncomment for air-gapped runs
 
     # - target: utils.training_logger.MLflowBackend
     #   params:

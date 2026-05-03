@@ -163,7 +163,7 @@ def main(args: dict, yaml_path: str):
     model_cfg = args.get('model', {})
     
     loader_cfg = args.get('loader', {})
-    duration = loader_cfg.get("dataset_config", {}).get("duration", 5.0)
+    duration = loader_cfg.get("dataset", {}).get("params", {}).get("duration_s", 5.0)
     
     augment_cfg = args.get('data_aug', {})
     auto_augment        = augment_cfg.get('auto_augment', False)
@@ -243,10 +243,10 @@ def main(args: dict, yaml_path: str):
     )
 
     dataloader, sampler = compile_dataloader(
-        train_cfg = loader_cfg,
-        transform = transforms,
-        world_sz  = world_size,
-        rank      = rank
+        loader_cfg = loader_cfg,
+        transform  = transforms,
+        world_sz   = world_size,
+        rank       = rank
     )
     # =================== INIT LOADER AND TRANSFORM =================== #
     
@@ -409,8 +409,11 @@ def main(args: dict, yaml_path: str):
             context_image = images[:, :, :split_fpcs]
             target_image  = images[:, :, split_fpcs:]
 
-            goal_idx = torch.randint(gen_chunksz + split_fpcs + 1, fpcs, (B,), dtype=torch.long, device=device)
-            goal     = ego_location[torch.arange(B, device=device), goal_idx]  # (B, 2)
+            if randomize_goal:
+                goal_idx = torch.randint(gen_chunksz + split_fpcs + 1, fpcs, (B,), dtype=torch.long, device=device)
+                goal     = ego_location[torch.arange(B, device=device), goal_idx]  # (B, 2)
+            else:
+                goal = ego_location[:, -1]
 
             choosen_target              = target_image[:, :, :gen_chunksz]
             latent_target         = world_model.encode_frames(choosen_target)
@@ -470,7 +473,6 @@ def main(args: dict, yaml_path: str):
 
         if dist.is_initialized() and world_size > 1:
             all_reduce(loss)
-            all_reduce(loss_pstep)
         
         return (
             loss, 
@@ -497,6 +499,7 @@ def main(args: dict, yaml_path: str):
 
                 iter_retries = 0
                 iter_success = False
+                _fetch_start = time.perf_counter()
                 while not iter_success:
                     try:
                         sample = next(loader)
@@ -513,8 +516,12 @@ def main(args: dict, yaml_path: str):
                         else:
                             logger.ERROR("Exceeded maximum retries when iterating dataloade. Please check for error", exit_code = 5, full_traceback = e)
                             
+                _fetch_ms = (time.perf_counter() - _fetch_start) * 1000
+
                 frames: NuplanFrame; images: torch.Tensor
-                frames, images = sample
+                frames, images, _sample_timing = sample
+                if frames is None or images is None:
+                    continue
 
                 (loss, loss_pstep, curr_lr, curr_wd), elapsed_time = gpu_timer(partial(train_step, frames, images))
 
@@ -526,10 +533,15 @@ def main(args: dict, yaml_path: str):
                     )
 
                 batch_metrics = {
-                    "LR":   curr_lr,
-                    "WD":   curr_wd,
-                    "Loss": loss_val,
+                    "LR":       curr_lr,
+                    "WD":       curr_wd,
+                    "Loss":     loss_val,
+                    "Fetch_ms": _fetch_ms,
+                    "Step_ms":  elapsed_time,
                 }
+                if _sample_timing is not None:
+                    for k, v in _sample_timing.items():
+                        batch_metrics[f"DB/{k}"] = v
                 for step_i, step_loss in enumerate(loss_pstep.tolist()):
                     batch_metrics[f"Loss|t{step_i}"] = step_loss
 

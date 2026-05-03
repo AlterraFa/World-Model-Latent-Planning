@@ -1,6 +1,7 @@
 import os
 import numpy as np
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor, as_completed
 try: 
     from turbojpeg import TurboJPEG
     _jpeg_loader = TurboJPEG("/usr/lib/libturbojpeg.so.0")
@@ -10,6 +11,20 @@ except Exception as e:
     _use_turbo = False
     import cv2
 _image_ext = ('.jpg', '.jpeg', '.png')
+
+# Number of threads for parallel image I/O within a single sample.
+# Tune via env var NUPLAN_IMG_THREADS (default 8).
+_IMG_THREADS = int(os.environ.get('NUPLAN_IMG_THREADS', '8'))
+
+# Decode JPEG at 1/N of original size using TurboJPEG DCT-domain scaling.
+# Valid values: 1 (full), 2 (half), 4 (quarter), 8 (eighth).
+# At 1/4, 1920×1080 → 480×270 — still > 224px so all crop transforms work.
+# The VideoTransform with scale≥1.0 always falls back to a full-image crop,
+# so source resolution > crop_size adds no quality benefit.
+# Override via NUPLAN_DECODE_DIVISOR env var.
+_DECODE_DIVISOR = int(os.environ.get('NUPLAN_DECODE_DIVISOR', '4'))
+# TurboJPEG scaling_factor tuple; must be one of (1,1),(1,2),(1,4),(1,8).
+_TJ_SCALE = (1, _DECODE_DIVISOR) if _DECODE_DIVISOR in (1, 2, 4, 8) else (1, 4)
 
 
 
@@ -53,18 +68,28 @@ def _decode_metadata(path):
 def _decode_image(path):
     if path.lower().endswith(_image_ext[:-1]):
         if _use_turbo:
-            # Method 1: TurboJPEG (Fastest)
+            # TurboJPEG with DCT-domain downscaling — avoids decoding the full
+            # 1920×1080 frame when only a 224×224 crop is needed downstream.
             with open(path, "rb") as f:
                 img_bytes = f.read()
-            # pixel_format=0 typically refers to TJPF_RGB in most turbojpeg wrappers
-            return _jpeg_loader.decode(img_bytes, pixel_format=0)
+            return _jpeg_loader.decode(img_bytes, pixel_format=0,
+                                       scaling_factor=_TJ_SCALE)
         else:
             img = cv2.imread(path)
             if img is not None:
-                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                if _DECODE_DIVISOR > 1:
+                    h, w = img.shape[:2]
+                    img = cv2.resize(img, (w // _DECODE_DIVISOR, h // _DECODE_DIVISOR),
+                                     interpolation=cv2.INTER_AREA)
+                return img
             else:
-                with Image.open(path) as img:
-                    return np.array(img.convert('RGB'))
+                with Image.open(path) as pil:
+                    if _DECODE_DIVISOR > 1:
+                        w, h = pil.size
+                        pil = pil.resize((w // _DECODE_DIVISOR, h // _DECODE_DIVISOR),
+                                         Image.BILINEAR)
+                    return np.array(pil.convert('RGB'))
     else: 
         with Image.open(path) as img:
             return np.array(img.convert('RGB'))
@@ -87,17 +112,69 @@ def _decode(path):
  
 def decode_batch(paths):
     """
-    Processes a list of image paths.
-    Note: We decode sequentially here because the DataLoader 
-    already parallelizes across multiple CPU cores.
+    Decode a list of image paths in parallel using a thread pool.
+    Threads overlap I/O wait (file reads) so per-sample latency drops
+    roughly proportionally to the number of threads on I/O-bound storage
+    (e.g. Kaggle NFS mounts).  CPU-bound JPEG decode also benefits because
+    TurboJPEG / OpenCV release the GIL during decompression.
     """
-    frames = []
-    for p in paths:
-        f = _decode_image(p)
-        if f is not None:
-            frames.append(f)
-    
+    if not paths:
+        return None
+
+    n = len(paths)
+    results = [None] * n
+
+    if n == 1 or _IMG_THREADS <= 1:
+        for i, p in enumerate(paths):
+            results[i] = _decode_image(p)
+    else:
+        with ThreadPoolExecutor(max_workers=min(_IMG_THREADS, n)) as ex:
+            futures = {ex.submit(_decode_image, p): i for i, p in enumerate(paths)}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    results[idx] = fut.result()
+                except Exception:
+                    results[idx] = None
+
+    frames = [f for f in results if f is not None]
     if not frames:
         return None
-    
+    return np.stack(frames, axis=0)
+
+
+def start_decode_batch(paths):
+    """Submit image decodes to a thread pool immediately; return (executor, futures).
+
+    Call :func:`collect_decode_batch` later to gather results.  The gap between
+    the two calls is "free" overlap time — use it for SQL meta queries.
+    Returns ``(None, {})`` when *paths* is empty.
+    """
+    if not paths or _IMG_THREADS <= 1:
+        return None, {}
+    n = len(paths)
+    ex = ThreadPoolExecutor(max_workers=min(_IMG_THREADS, n))
+    futures = {ex.submit(_decode_image, p): i for i, p in enumerate(paths)}
+    return ex, futures
+
+
+def collect_decode_batch(executor, futures, n_paths):
+    """Collect results from :func:`start_decode_batch`.  Returns ndarray or None.
+
+    Falls back to synchronous sequential decode when *executor* is ``None``
+    (i.e. when *paths* was empty or threading is disabled).
+    """
+    if executor is None:
+        return None
+    results = [None] * n_paths
+    for fut in as_completed(futures):
+        idx = futures[fut]
+        try:
+            results[idx] = fut.result()
+        except Exception:
+            results[idx] = None
+    executor.shutdown(wait=False)
+    frames = [f for f in results if f is not None]
+    if not frames:
+        return None
     return np.stack(frames, axis=0)

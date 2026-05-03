@@ -40,6 +40,7 @@ class CollateNuplan:
         # Support dict-based samples from load_sequences.
         if isinstance(flat_batch[0], dict):
             images_list = [item.get("images") for item in flat_batch]
+            timing_list = [item["timing_ms"] for item in flat_batch if item.get("timing_ms") is not None]
             frames = []
             for item in flat_batch:
                 if "frame" in item and item["frame"] is not None:
@@ -48,6 +49,7 @@ class CollateNuplan:
                 frames.append(sample_dict_to_nuplan_frame(item))
         else:
             # Backward compatibility for tuple/list sample format.
+            timing_list = []
             frames, images_list = zip(*flat_batch)
 
         valid_pairs = [(f, i) for f, i in zip(frames, images_list) if f is not None]
@@ -108,7 +110,13 @@ class CollateNuplan:
             roadblock_ids=[f.roadblock_ids for f in frames],
         )
 
-        return batched_frame, stacked_images
+        # Average per-phase timing across the batch (only present when NUPLAN_TIMING=1).
+        avg_timing: dict | None = None
+        if timing_list:
+            keys = timing_list[0].keys()
+            avg_timing = {k: round(sum(d[k] for d in timing_list) / len(timing_list), 2) for k in keys}
+
+        return batched_frame, stacked_images, avg_timing
 
 
 
