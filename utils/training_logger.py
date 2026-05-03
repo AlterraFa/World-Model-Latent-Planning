@@ -1,6 +1,7 @@
 import os
 import csv
 import sys
+import socket
 from abc import ABC
 from typing import Dict, Optional, List, Literal, Union, Tuple, Any
 from collections import defaultdict
@@ -35,6 +36,7 @@ try:
 except ImportError:
     PROGRESS_TABLE_AVAILABLE = False
 
+IS_KAGGLE = bool(os.environ.get('KAGGLE_URL_BASE') or os.environ.get('KAGGLE_KERNEL_RUN_TYPE'))
 IS_KAGGLE_COMMIT = os.environ.get('KAGGLE_KERNEL_RUN_TYPE', '') == 'Batch'
 
 if IS_KAGGLE_COMMIT:
@@ -53,6 +55,15 @@ def _to_scalar(value) -> float:
     if isinstance(value, torch.Tensor):
         return value.item()
     return float(value)
+
+
+def _has_internet(host: str = "api.wandb.ai", port: int = 443, timeout: float = 2.0) -> bool:
+    """Return True when a short TCP probe succeeds."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 # ================================================================== #
@@ -196,10 +207,15 @@ class WandbBackend(LoggerBackend):
         if not WANDB_AVAILABLE:
             raise ImportError("wandb is not installed.  pip install wandb")
 
-        # Auto-switch to offline when running in a Kaggle Batch kernel or any
-        # environment that has explicitly set WANDB_MODE=offline.
-        if mode == "online" and (IS_KAGGLE_COMMIT or os.environ.get("WANDB_MODE", "").lower() == "offline"):
-            logger.INFO("WandbBackend: offline environment detected — switching to mode='offline'")
+        # Auto-switch to offline when running in non-networked environments,
+        # Kaggle Batch kernels, or when explicitly requested.
+        offline_env = (
+            IS_KAGGLE
+            or os.environ.get("WANDB_MODE", "").lower() == "offline"
+            or not _has_internet()
+        )
+        if mode == "online" and offline_env:
+            logger.INFO("WandbBackend: no internet/offline env detected - switching to mode='offline'")
             mode = "offline"
 
         # Flatten OmegaConf objects so wandb can serialise them
@@ -212,7 +228,7 @@ class WandbBackend(LoggerBackend):
                 for k, v in config.items()
             }
 
-        self._run = wandb.init(
+        init_kwargs = dict(
             project=project,
             entity=entity,
             name=run_name,
@@ -222,8 +238,22 @@ class WandbBackend(LoggerBackend):
             mode=mode,
             resume=resume,
             dir=log_dir,
+            save_code=False,
         )
+        try:
+            self._run = wandb.init(**init_kwargs)
+        except Exception as e:
+            if mode == "online":
+                logger.WARNING(
+                    "WandbBackend: online init failed, retrying offline. "
+                    f"Reason: {type(e).__name__}: {e}"
+                )
+                init_kwargs["mode"] = "offline"
+                self._run = wandb.init(**init_kwargs)
+            else:
+                raise
         wandb.define_metric("epoch")
+        wandb.define_metric("global_step")
         wandb.define_metric("Train/*", step_metric="epoch")
         wandb.define_metric("Val/*",   step_metric="epoch")
         wandb.define_metric("Misc/*",  step_metric="epoch")
@@ -234,7 +264,7 @@ class WandbBackend(LoggerBackend):
         self._watch_log_freq = watch_log_freq
 
     def log_epoch_scalars(self, metrics: Dict[str, float], epoch: int) -> None:
-        wandb.log({"epoch": epoch, **metrics}, step=epoch)
+        wandb.log({"epoch": epoch, **metrics})
         # Keep run summary up to date for cross-run comparisons
         summary = {k: v for k, v in metrics.items()
                    if k.startswith(("Train/", "Val/"))}
@@ -242,21 +272,21 @@ class WandbBackend(LoggerBackend):
             self.update_summary(summary)
 
     def log_iter_scalars(self, metrics: Dict[str, float], global_step: int) -> None:
-        wandb.log({"global_step": global_step, **metrics}, step=global_step)
+        wandb.log({"global_step": global_step, **metrics})
 
     def log_scalar(self, tag: str, value: float, step: int) -> None:
-        wandb.log({tag: value}, step=step)
+        wandb.log({"global_step": step, tag: value})
 
     def log_histogram(self, tag: str, values, step: int) -> None:
         if isinstance(values, torch.Tensor):
             values = values.detach().cpu().numpy()
-        wandb.log({tag: wandb.Histogram(values)}, step=step)
+        wandb.log({"global_step": step, tag: wandb.Histogram(values)})
 
     def log_media(self, tag: str, media, media_type: str, step: int,
                   caption: Optional[str] = None) -> None:
         if isinstance(media, (wandb.Image, wandb.Audio, wandb.Video,
                                wandb.Html, wandb.Molecule)):
-            wandb.log({tag: media}, step=step)
+            wandb.log({"global_step": step, tag: media})
             return
         kw = {"caption": caption} if caption else {}
         _wrap = {
@@ -266,14 +296,14 @@ class WandbBackend(LoggerBackend):
             "html":     lambda m: wandb.Html(m),
             "molecule": lambda m: wandb.Molecule(m, **kw),
         }
-        wandb.log({tag: _wrap.get(media_type, lambda m: m)(media)}, step=step)
+        wandb.log({"global_step": step, tag: _wrap.get(media_type, lambda m: m)(media)})
 
     def log_table(self, key: str, columns: List[str], rows: List[List[Any]],
                   step: int) -> None:
-        wandb.log({key: wandb.Table(columns=columns, data=rows)}, step=step)
+        wandb.log({"global_step": step, key: wandb.Table(columns=columns, data=rows)})
 
     def log_plot(self, key: str, plot: Any, step: int) -> None:
-        wandb.log({key: plot}, step=step)
+        wandb.log({"global_step": step, key: plot})
 
     def alert(self, title: str, text: str, level: str = "WARN") -> None:
         wandb.alert(title=title, text=text, level=level)
@@ -1253,8 +1283,9 @@ def build_backends(
         # Apply offline overrides per-backend type
         if force_offline:
             cls_name = target.rsplit(".", 1)[-1]
-            if cls_name == "WandbBackend" and params.get("mode", "online") == "online":
-                params["mode"] = "offline"
+            if cls_name == "WandbBackend":
+                logger.INFO(f"build_backends: skipping WandbBackend in offline/airgapped environment")
+                continue
             elif cls_name == "MLflowBackend":
                 params.setdefault("offline", True)
 
