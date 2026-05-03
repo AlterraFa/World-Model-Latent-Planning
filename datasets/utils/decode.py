@@ -12,17 +12,9 @@ except Exception as e:
     import cv2
 _image_ext = ('.jpg', '.jpeg', '.png')
 
-# Number of threads for parallel image I/O within a single sample.
-# Tune via env var NUPLAN_IMG_THREADS (default 8).
-_IMG_THREADS = int(os.environ.get('NUPLAN_IMG_THREADS', '8'))
+_IMG_THREADS = int(os.environ.get('DECODE_THREADS', '8'))
 
-# Decode JPEG at 1/N of original size using TurboJPEG DCT-domain scaling.
-# Valid values: 1 (full), 2 (half), 4 (quarter), 8 (eighth).
-# At 1/4, 1920×1080 → 480×270 — still > 224px so all crop transforms work.
-# The VideoTransform with scale≥1.0 always falls back to a full-image crop,
-# so source resolution > crop_size adds no quality benefit.
-# Override via NUPLAN_DECODE_DIVISOR env var.
-_DECODE_DIVISOR = int(os.environ.get('NUPLAN_DECODE_DIVISOR', '4'))
+_DECODE_DIVISOR = int(os.environ.get('DECODE_DIVISOR', '4'))
 # TurboJPEG scaling_factor tuple; must be one of (1,1),(1,2),(1,4),(1,8).
 _TJ_SCALE = (1, _DECODE_DIVISOR) if _DECODE_DIVISOR in (1, 2, 4, 8) else (1, 4)
 
