@@ -57,16 +57,26 @@ class CollateNuplan:
             return None, None
         frames, images_list = zip(*valid_pairs)
 
-        # Stack images → (B, N, H, W, C) tensor; pad missing with zeros
+        # Stack images → (B, ...) tensor; pad missing with zeros.
+        # VideoTransform returns torch Tensors; use torch.stack directly to
+        # avoid the numpy round-trip of np.stack + torch.from_numpy.
         stacked_images = None
         valid_images = [img for img in images_list if img is not None]
         if valid_images:
-            ref_shape = valid_images[0].shape  # (N, H, W, C)
-            arrays = [
-                img if img is not None else np.zeros(ref_shape, dtype=np.uint8)
-                for img in images_list
-            ]
-            stacked_images = torch.from_numpy(np.stack(arrays, axis=0))
+            ref_shape = valid_images[0].shape
+            if isinstance(valid_images[0], torch.Tensor):
+                ref_dtype = valid_images[0].dtype
+                arrays = [
+                    img if img is not None else torch.zeros(ref_shape, dtype=ref_dtype)
+                    for img in images_list
+                ]
+                stacked_images = torch.stack(arrays, dim=0)
+            else:
+                arrays = [
+                    img if img is not None else np.zeros(ref_shape, dtype=np.uint8)
+                    for img in images_list
+                ]
+                stacked_images = torch.from_numpy(np.stack(arrays, axis=0))
 
         # timestamp → (B,) int64
         timestamp_tensor = torch.tensor([f.timestamp for f in frames], dtype=torch.int64)

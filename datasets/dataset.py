@@ -8,12 +8,7 @@ root_dir = os.path.dirname(os.path.dirname(os.path.dirname(script_dir)))
 if root_dir not in sys.path:
     sys.path.append(root_dir)
     
-import pandas as pd
 import numpy as np
-import glob
-import torch
-import re
-import random
 import threading
 import sqlite3
 from torch.utils.data import Dataset
@@ -747,6 +742,7 @@ class NuplanNumpyDataset(Dataset):
         npz_paths,
         image_root: str = "./",
         fpcs: int = 16,
+        max_image_fpcs: int | None = None,
         duration_s: float = 10.0,
         random_jiggle_part: bool = True,
         shared_transform=None,
@@ -754,9 +750,19 @@ class NuplanNumpyDataset(Dataset):
         n_clips: int = 1,
         allow_clip_overlap: bool = True,
     ):
+        """
+        max_image_fpcs: maximum number of image frames to decode per clip.
+            Only this many JPEG files will be read and decoded; all ``fpcs``
+            frames of metadata (ego_pose, frame_timestamps) are still returned
+            so that frame-rate and goal computations remain accurate.
+            Set to ``split_fpcs + gen_chunksz`` (i.e. context frames + target
+            frames) to avoid loading frames that are never consumed by the
+            model.  ``None`` (default) decodes all ``fpcs`` frames.
+        """
         super().__init__()
         self.image_root = image_root
         self.fpcs = fpcs
+        self.max_image_fpcs = max_image_fpcs if max_image_fpcs is not None else fpcs
         self.duration_s = duration_s
         self.random_jiggle_part = random_jiggle_part
         self.individual_transform = individual_transform
@@ -900,6 +906,7 @@ class NuplanNumpyDataset(Dataset):
         anchor_token: str,
         anchor_ts: int,
     ) -> dict:
+        _t0 = time.perf_counter() if _TIMING else 0.0
         empty_meta = {
             "token": anchor_token, "timestamp": anchor_ts,
             "image_paths": [], "frame_tokens": [], "frame_timestamps": [],
@@ -912,30 +919,61 @@ class NuplanNumpyDataset(Dataset):
                 "timing_ms": None, "meta": empty_meta,
             }
 
-        image_paths      = [self._resolve_image_path(row[0]) for row in sampled_cam_rows]
+        # Full metadata for ALL sampled frames (needed for frame-rate and goal
+        # computation which look at the entire clip window).
         frame_timestamps = [row[1] for row in sampled_cam_rows]
         frame_tokens_hex = [""] * len(sampled_cam_rows)
+        all_image_paths  = [row[0] for row in sampled_cam_rows]  # stored in meta
+
+        # Decode only up to max_image_fpcs frames — avoids loading frames that
+        # will never reach the GPU and prevents the DataLoader queue from
+        # bloating RAM (e.g. 32 frames × 128 samples × 2 prefetch = ~6 GB).
+        n_img       = min(self.max_image_fpcs, len(sampled_cam_rows))
+        image_paths = [self._resolve_image_path(row[0]) for row in sampled_cam_rows[:n_img]]
 
         # Submit image reads before any CPU work (no SQL to overlap, but
         # keeps the same decode path — with DCT-domain scaling — as NuplanDataset).
         _img_executor, _img_futures = start_decode_batch(image_paths)
 
-        # ego_pose array: (N, 7) float32
+        # ego_pose array: (N, 7) float32 — keep ALL fpcs frames so that goal
+        # sampling (randomize_goal) can index into any position up to fpcs-1.
         if sampled_ego_pose.size > 0:
             ego_pose_np = np.asarray(sampled_ego_pose, dtype=np.float32)
         else:
             ego_pose_np = np.full((len(sampled_cam_rows), 7), np.nan, dtype=np.float32)
 
         # Collect images
+        _t_img0 = time.perf_counter() if _TIMING else 0.0
         if _img_executor is not None:
             images = collect_decode_batch(_img_executor, _img_futures, len(image_paths))
         else:
             images = decode_batch(image_paths)
+        _t_img = (time.perf_counter() - _t_img0) * 1000 if _TIMING else 0.0
 
+        _t_xfrm0 = time.perf_counter() if _TIMING else 0.0
         if images is not None and self.individual_transform is not None:
             images = np.array([self.individual_transform(img) for img in images])
         if images is not None and self.shared_transform is not None:
             images = self.shared_transform(images)
+        _t_xfrm = (time.perf_counter() - _t_xfrm0) * 1000 if _TIMING else 0.0
+
+        _timing_ms: dict | None = None
+        if _TIMING:
+            _t_total = (time.perf_counter() - _t0) * 1000
+            _timing_ms = {
+                "npz_img_ms": round(_t_img, 2),
+                "npz_xfrm_ms": round(_t_xfrm, 2),
+                "npz_clip_total_ms": round(_t_total, 2),
+                "npz_n_frames": float(len(image_paths)),
+            }
+            sys.stderr.write(
+                f"[nuplan npz timing] "
+                f"img_decode={_t_img:6.1f}ms  "
+                f"transform={_t_xfrm:6.1f}ms  "
+                f"clip_total={_t_total:6.1f}ms  "
+                f"n_frames={len(image_paths)}\n"
+            )
+            sys.stderr.flush()
 
         return {
             "images":         images,
@@ -943,11 +981,11 @@ class NuplanNumpyDataset(Dataset):
             "agents":         [],
             "traffic_lights": [],
             "scenario_tags":  [],
-            "timing_ms":      None,
+            "timing_ms":      _timing_ms,
             "meta": {
                 "token":            anchor_token,
                 "timestamp":        anchor_ts,
-                "image_paths":      image_paths,
+                "image_paths":      all_image_paths,
                 "frame_tokens":     frame_tokens_hex,
                 "frame_timestamps": frame_timestamps,
                 "map_version":      "",
@@ -964,6 +1002,7 @@ class NuplanNumpyDataset(Dataset):
     def load_sequences(self, index: int) -> dict | None:
         key   = self.samples[index]
         cache = self._log_time_cache[key]
+        _t_select_total = 0.0
 
         anchor_ts       = cache["anchor_ts"]
         anchor_token    = cache["anchor_token"]
@@ -982,6 +1021,7 @@ class NuplanNumpyDataset(Dataset):
         fpcs  = max(1, self.fpcs)
         clips = []
         for start_ts in start_positions:
+            _t_sel0 = time.perf_counter() if _TIMING else 0.0
             end_ts  = start_ts + duration_us
             i_start = bisect.bisect_left(cam_timestamps,  start_ts)
             i_end   = bisect.bisect_right(cam_timestamps, end_ts)
@@ -995,9 +1035,12 @@ class NuplanNumpyDataset(Dataset):
                 indices          = np.linspace(0, len(window) - 1, fpcs, dtype=int)
                 sampled_rows     = [window[i] for i in indices]
                 sampled_ego_pose = ep_win[indices]
+            if _TIMING:
+                _t_select_total += (time.perf_counter() - _t_sel0) * 1000
 
-            clips.append(
-                self._build_clip(sampled_rows, sampled_ego_pose, anchor_token, anchor_ts)
-            )
+            clip = self._build_clip(sampled_rows, sampled_ego_pose, anchor_token, anchor_ts)
+            if _TIMING and clip.get("timing_ms") is not None:
+                clip["timing_ms"]["npz_select_ms"] = round(_t_select_total, 2)
+            clips.append(clip)
 
         return {"clips": clips}
