@@ -30,6 +30,7 @@ from .compile import (
     compile_dataloader,
     compile_opt
 )
+from .compile._visualize import visualize_batch
 from utils.training_logger import (
     get_next_run,
     create_self_supervised_logger,
@@ -231,6 +232,13 @@ def main(args: dict, yaml_path: str):
     log_batch_scalars         = logging_cfg.get('log_batch_scalars', False)
     log_model_graph       = logging_cfg.get('log_model_graph', False)
 
+    viz_cfg      = args.get('viz', {})
+    viz_freq     = viz_cfg.get('freq', 0)       # 0 = disabled
+    viz_nfe      = viz_cfg.get('nfe', 20)
+    viz_eta      = viz_cfg.get('eta', 0.0)
+    viz_neighbors = viz_cfg.get('umap_neighbors', 30)
+    viz_up_power  = viz_cfg.get('up_power', 16)
+
     torch.manual_seed(seed)
     world_size, rank = init_distributed()
     if rank == 0:
@@ -400,7 +408,8 @@ def main(args: dict, yaml_path: str):
         gc.collect()
 
     loader = iter(dataloader)
-    
+    _viz_sample: tuple | None = None   # holds (frames, images) from last batch
+
     def train_step(frames: NuplanFrame, images: torch.Tensor):
         _new_lr = lr_scheduler.step()
         _new_wd = wd_scheduler.step()
@@ -438,10 +447,11 @@ def main(args: dict, yaml_path: str):
             target_image  = images[:, :, split_fpcs:]
 
             if randomize_goal:
-                goal_idx = torch.randint(gen_chunksz + split_fpcs + 1, fpcs, (B,), dtype=torch.long, device=device)
+                goal_idx = torch.randint(gen_chunksz + split_fpcs, fpcs, (B,), dtype=torch.long, device=device) 
                 goal     = ego_location[torch.arange(B, device=device), goal_idx]  # (B, 2)
             else:
-                goal = ego_location[:, -1]
+                # Note:  Lets test this out and sort of cheat then we can move on to hierachical style
+                goal = ego_location[:, gen_chunksz + split_fpcs]
 
             choosen_target              = target_image[:, :, :gen_chunksz]
             latent_target         = world_model.encode_frames(choosen_target)
@@ -454,10 +464,12 @@ def main(args: dict, yaml_path: str):
             params_k = []
             params_q = []
             for param_q, param_k in zip(world_model.parameters(), ema_wm.parameters()):
-                params_k.append(param_k)
-                params_q.append(param_q)
-            torch._foreach_mul_(params_k, decay)
-            torch._foreach_add_(params_k, params_q, alpha=1 - decay)
+                if param_q.requires_grad:
+                    params_k.append(param_k)
+                    params_q.append(param_q)
+            if params_q:
+                torch._foreach_mul_(params_k, decay)
+                torch._foreach_add_(params_k, params_q, alpha=1 - decay)
             
         
         
@@ -524,10 +536,6 @@ def main(args: dict, yaml_path: str):
 
     with log_stats:
         log_stats.start_training("Diffusion World Model conditioned on Goal")
-        logger.INFO(
-            "Convergence diagnostics enabled: Diag/ZeroBaselineRatio < 1 and "
-            "Diag/ExplainedVar > 0 indicate learning even when raw Loss is ~1.0"
-        )
         sampler.set_epoch(start_epoch)
         
         for epoch in range(start_epoch, num_epochs):
@@ -561,6 +569,8 @@ def main(args: dict, yaml_path: str):
                 if frames is None or images is None:
                     continue
 
+                _viz_sample = (frames, images)
+
                 (
                     loss,
                     loss_pstep,
@@ -580,8 +590,8 @@ def main(args: dict, yaml_path: str):
                     "LR":       curr_lr,
                     "WD":       curr_wd,
                     "Loss":     loss_val,
-                    "Fetch_ms": _fetch_ms,
-                    "Step_ms": elapsed_time,
+                    # "Fetch_ms": _fetch_ms,
+                    # "Step_ms": elapsed_time,
                 }
                 if _sample_timing is not None:
                     for k, v in _sample_timing.items():
@@ -591,8 +601,41 @@ def main(args: dict, yaml_path: str):
                 batch_metrics['Gradnorm'] = grad_norm
 
                 log_stats.log_batch(batch_metrics)
+            
 
             log_stats.log_epoch()
+
+            # ── latent visualisation (rank-0 only, non-blocking) ──────────
+            if (
+                rank == 0
+                and viz_freq > 0
+                and (epoch % viz_freq == 0 or epoch == num_epochs - 1)
+                and _viz_sample is not None
+            ):
+                _viz_frames, _viz_images = _viz_sample
+                try:
+                    visualize_batch(
+                        world_model=ema_wm,
+                        images=_viz_images,
+                        frames=_viz_frames,
+                        device=device,
+                        dtype=dtype,
+                        mixed_precision=mixed_precision,
+                        context_length=context_length,
+                        duration=duration,
+                        fpcs=fpcs,
+                        gen_chunksz=gen_chunksz,
+                        loss_exp=loss_exp,
+                        randomize_goal=randomize_goal,
+                        nfe=viz_nfe,
+                        eta=viz_eta,
+                        n_neighbors=viz_neighbors,
+                        up_power=viz_up_power,
+                        epoch=epoch,
+                        log_stats=log_stats,
+                    )
+                except Exception as _viz_err:
+                    logger.WARNING(f"Visualisation failed (epoch {epoch}): {_viz_err}")
 
             if sync_gc:
                 gc.collect()

@@ -7,7 +7,7 @@ common: &common_settings
   fpcs: 32
 
 loader:
-  batch_size: 8
+  batch_size: 4
   num_workers: 4
   persistent_workers: true
   pin_memory: true
@@ -92,7 +92,7 @@ optimization:
   ema:
     - 0.99925
     - 0.99925
-  ipe: 150
+  ipe: 10
   anneal: 30
   epochs: 50
   warmup: 10
@@ -142,3 +142,10 @@ logging:
     #     run_name: null
     #     tracking_uri: http://localhost:5000
     #     log_model_artifact: false
+
+viz:
+  freq: 1             # log UMAP images every N epochs (0 = disabled)
+  nfe: 25             # diffusion steps for rollout
+  eta: 0.0            # DDIM eta
+  umap_neighbors: 30
+  up_power: 16        # spatial upscale factor (patch grid → display)
