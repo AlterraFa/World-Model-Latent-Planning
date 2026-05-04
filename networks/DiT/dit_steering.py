@@ -1,6 +1,5 @@
 import numpy as np
 import torch
-import torch.utils.checkpoint as checkpoint
 from torch import nn
 from .dit import STDiT
 from utils.autoload_modules import instantiate_from_config
@@ -129,10 +128,7 @@ class STDiTGoalConditioned(STDiT):
         x = self.preprocess_inputs(target, context, t, frame_rate)
 
         for block in self.blocks:
-            if self.grad_checkpointing and self.training:
-                x = checkpoint.checkpoint(block, x, c, use_reentrant=False)
-            else:
-                x = block(x, c)
+            x = block(x, c)
         out = self.final_layer(x[:,-num_frames_pred:], c)
 
         out = self.postprocess_outputs(out)

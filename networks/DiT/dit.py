@@ -420,14 +420,14 @@ class STDiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, diffuse_dim, num_heads, mlp_ratio=4.0, dropout_rate=0.0, causal_time_attn=False, modulate_time_attn=False, norm_layer=nn.LayerNorm, mlp_block='mlp', **block_kwargs):
+    def __init__(self, diffuse_dim, num_heads, mlp_ratio=4.0, dropout_rate=0.0, causal_time_attn=False, modulate_time_attn=False, norm_layer=nn.LayerNorm, mlp_block='mlp', grad_checkpointing=False, **block_kwargs):
         super().__init__()
+        self.grad_checkpointing = grad_checkpointing
         self.norm1 = norm_layer(diffuse_dim, elementwise_affine=False, eps=1e-6)
         self.space_attn = Attention(diffuse_dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=norm_layer, attn_drop=dropout_rate, proj_drop=dropout_rate, **block_kwargs)
         self.time_attn = Attention(diffuse_dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=norm_layer, attn_drop=dropout_rate, proj_drop=dropout_rate, **block_kwargs)
         self.norm2 = norm_layer(diffuse_dim, elementwise_affine=False, eps=1e-6)
         self.norm3 = norm_layer(diffuse_dim, elementwise_affine=False, eps=1e-6)
-        self.norm4 = norm_layer(diffuse_dim, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(diffuse_dim * mlp_ratio)
         
         if mlp_block == 'mlp':
@@ -472,30 +472,34 @@ class STDiTBlock(nn.Module):
             shift_mta, scale_mta, gate_mta = self.adaLN_time_attn_modulation(c).chunk(3, dim=1)
         else:
             shift_mta, scale_mta, gate_mta = torch.zeros_like(shift_mlp_t), torch.zeros_like(scale_mlp_t), torch.ones_like(gate_mlp_t)
-        
-        #-- spatial attention and modulation
-        x_modulated = modulate(self.norm1(x), shift_msa, scale_msa)
-        x_modulated = rearrange(x_modulated, 'b f n d -> (b f) n d', b=B, f=F)
-        x_ = self.space_attn(x_modulated)
-        x_ = rearrange(x_, '(b f) n d -> b f n d', b=B, f=F)
-        x = x + gate_msa.unsqueeze(1).unsqueeze(1) * x_
 
-        #-- spatial projection and modulation
-        x_modulated = modulate(self.norm2(x), shift_mlp_s, scale_mlp_s)
-        x = x + gate_mlp_s.unsqueeze(1).unsqueeze(1) * self.space_mlp(x_modulated)
+        #-- spatial attention + mlp block
+        def _space_block(x, shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp):
+            x_mod = modulate(self.norm1(x), shift_attn, scale_attn)
+            x_mod = rearrange(x_mod, 'b f n d -> (b f) n d')
+            x = x + gate_attn.unsqueeze(1).unsqueeze(1) * rearrange(self.space_attn(x_mod), '(b f) n d -> b f n d', b=B, f=F)
+            x = x + gate_mlp.unsqueeze(1).unsqueeze(1) * self.space_mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+            return x
 
-        #-- temporal attention and modulation
-        x_modulated = modulate(self.norm_time_attn(x), shift_mta, scale_mta)
-        x_modulated = rearrange(x_modulated, 'b f n d -> (b n) f d', b=B, f=F, n=N)
-        time_attn_mask = torch.tril(torch.ones(F, F, device=x.device)) if self.causal_time_attn else None
-        x_ = self.time_attn(x_modulated, attn_mask=time_attn_mask)
-        x_ = rearrange(x_, '(b n) f d -> b f n d', b=B, n=N, f=F)
-        x = x + gate_mta.unsqueeze(1).unsqueeze(1) * x_
+        if self.grad_checkpointing and self.training:
+            x = checkpoint.checkpoint(_space_block, x, shift_msa, scale_msa, gate_msa, shift_mlp_s, scale_mlp_s, gate_mlp_s, use_reentrant=False)
+        else:
+            x = _space_block(x, shift_msa, scale_msa, gate_msa, shift_mlp_s, scale_mlp_s, gate_mlp_s)
 
-        #-- temporal projection and modulation
-        x_modulated = modulate(self.norm3(x), shift_mlp_t, scale_mlp_t)
-        x = x + gate_mlp_t.unsqueeze(1).unsqueeze(1) * self.time_mlp(x_modulated)  
-        
+        #-- temporal attention + mlp block
+        def _time_block(x, shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp):
+            x_mod = modulate(self.norm_time_attn(x), shift_attn, scale_attn)
+            x_mod = rearrange(x_mod, 'b f n d -> (b n) f d')
+            mask = torch.tril(torch.ones(F, F, device=x.device)) if self.causal_time_attn else None
+            x = x + gate_attn.unsqueeze(1).unsqueeze(1) * rearrange(self.time_attn(x_mod, attn_mask=mask), '(b n) f d -> b f n d', b=B, n=N, f=F)
+            x = x + gate_mlp.unsqueeze(1).unsqueeze(1) * self.time_mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
+            return x
+
+        if self.grad_checkpointing and self.training:
+            x = checkpoint.checkpoint(_time_block, x, shift_mta, scale_mta, gate_mta, shift_mlp_t, scale_mlp_t, gate_mlp_t, use_reentrant=False)
+        else:
+            x = _time_block(x, shift_mta, scale_mta, gate_mta, shift_mlp_t, scale_mlp_t, gate_mlp_t)
+
         return x
 
 
@@ -749,7 +753,7 @@ class STDiT(DiT):
         self.blocks = nn.ModuleList([
                 STDiTBlock(diffuse_dim, num_heads, mlp_ratio=mlp_ratio, dropout_rate=dropout, 
                            causal_time_attn=causal_time_attn, modulate_time_attn=modulate_time_attn, 
-                           norm_layer=norm_layer, mlp_block=mlp_block) for _ in range(depth)
+                           norm_layer=norm_layer, mlp_block=mlp_block, grad_checkpointing=grad_checkpointing) for _ in range(depth)
             ])
 
     def forward(self, target, context, t, frame_rate, return_features=False):
@@ -766,10 +770,7 @@ class STDiT(DiT):
 
         features = []
         for block in self.blocks:
-            if self.grad_checkpointing and self.training:
-                x = checkpoint.checkpoint(block, x, c, use_reentrant=False)
-            else:
-                x = block(x, c)
+            x = block(x, c)
             features.append(x) if return_features else None
 
 
