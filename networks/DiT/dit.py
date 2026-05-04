@@ -618,15 +618,6 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], x.shape[1], c, h * p, w * p))
         return imgs
 
-
-    def get_condition_embeddings(self, t):
-        """
-        Get the condition embeddings for the given timesteps.
-        t: (N,) tensor of diffusion timesteps
-        returns: (N, D) tensor of condition embeddings
-        """
-        return self.t_embedder(t)
-    
     def get_condition_embeddings(self, t):
         """
         Get the condition embeddings for the given timesteps.

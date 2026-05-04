@@ -28,8 +28,6 @@ class DiffusionGoal(DiffusionWM):
         return pred
     
     def roll_out(self, images: torch.Tensor, n_hallucination: int, chunk_gen: int = 1, goal = None, eta = 0.0, NFE = 20):
-        B, T = images.shape[:2]
-        n_ctx_frames = T
         x_c = self.encode_frames(images)
         
         x_all = [x_c.clone()]
@@ -37,8 +35,7 @@ class DiffusionGoal(DiffusionWM):
             goal = torch.full((images.shape[0], 2), torch.nan, device = images.device)
 
         num_steps = math.ceil(n_hallucination // chunk_gen)
-        for idx in tqdm(range(num_steps)):
-        
+        for idx in range(num_steps):
             x_last_t = self.sample(z = x_c, chunk_gen = chunk_gen, goal = goal, NFE = NFE, eta = eta, frame_rate = None)
             x_all.append(x_last_t)
             x_c = torch.cat([x_c[:, chunk_gen:], x_last_t], dim = 1)
